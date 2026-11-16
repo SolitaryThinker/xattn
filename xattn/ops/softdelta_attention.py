@@ -422,6 +422,9 @@ def _forward(q, k, v, g, k_read, prev_k, prev_v, q_segment_idx, k_segment_idx, s
     overwrites the query reads with ``y`` in place; ``y`` and ``neg_read`` are head slices of that
     buffer. Level 1 reads in FP32 and gates once into ``y``; the FP32 query reads are dropped.
     """
+    if level and _native_reads(q):
+        # Internal callers (the value-group function) reach here without _prepare's refusal.
+        raise _native_level_refusal(_API)
     batch, length, q_heads, _ = q.shape
     kv_heads = k.shape[2]
     groups, group_dim = v.shape[3:]
@@ -489,6 +492,8 @@ def _backward(y_grad, q, k, v, g, k_read, prev_k, prev_v, q_segment_idx, k_segme
     backward, then each read's backward, summed in FP32 at level 1 (the precision-repair backward,
     which reads neither ``y`` nor the LSE); level 0 recovers the query reads from ``y``.
     """
+    if level and _native_reads(q):
+        raise _native_level_refusal(_API)
     batch, length, q_heads, _ = q.shape
     kv_heads = k.shape[2]
     groups, group_dim = v.shape[3:]
