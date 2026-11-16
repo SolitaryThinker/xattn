@@ -86,3 +86,16 @@ Output layouts:
 - `dq`, `dk`, `dv`, `dg`: same shapes and dtypes as `q`, `k`, `v`, `g`
 - `dk_read`: same shape and dtype as `k_read`, or `None` when `k_read=None`
 - `dprev_k`, `dprev_v`: same shapes and dtypes as previous K/V, or `None`
+
+## Blackwell (sm_103a)
+
+On a compute capability 10.x GPU with an extension built for `sm_103a`,
+`backend="auto"` runs SoftDelta at `high_precision_level=0` as a composition of
+the native Blackwell FlashSCA reads (the inclusive read by `q` over grouped
+heads with FP32 dK/dV, and the strict-past read by `k_read`) with the gate,
+restore and gradient-merge kernels, for previous K/V, segment ids, BOS masks,
+short queries and `reset_chunk_pos_per_seq`. Every call is deterministic: the
+forward and the backward repeat bit-exactly whatever `deterministic` is set to.
+`high_precision_level=1` raises `NotImplementedError` there before anything
+runs, and so does `backend="sm90"` (`RuntimeError`); nothing falls back to the
+PyTorch reference, which runs only for `backend="torch"`.

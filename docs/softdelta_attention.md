@@ -70,3 +70,15 @@ Output layouts:
 - `lse`: `[batch, kv_heads + q_heads, seqlen]`, FP32, the negative reads first
 - `dq`, `dk`, `dv`, `dg`: same shapes and dtypes as `q`, `k`, `v`, `g`
 - `dk_read`: same shape and dtype as `k_read`, or `None` when `k_read=None`
+
+## Blackwell (sm_103a)
+
+On a compute capability 10.x GPU with an extension built for `sm_103a`,
+`backend="auto"` runs causal SoftDelta at `high_precision_level=0` on the
+native Blackwell FlashSCA reads, each read as one sliding chunk holding every
+key (with short queries right-aligned to the keys, segment ids and BOS masks),
+composed with the gate, restore and gradient-merge kernels. Every call is
+deterministic whatever `deterministic` is set to. `high_precision_level=1`
+raises `NotImplementedError` there before anything runs; a sliding window
+(`sliding_window_softdelta_attention`) that does not cover every earlier key
+raises `NotImplementedError` too, and a covering one runs as causal.
