@@ -26,6 +26,15 @@ The public API takes scalar gates: ``v`` ``[B, Lkv, Hkv, V]`` and one gate logit
 per query head and token, ``g`` ``[B, Lq, H]``. The implementation keeps value
 groups (``v`` ``[B, Lkv, Hkv, C, Dg]``, ``g`` ``[B, Lq, H, C, 1]``, a gate per
 group of ``Dg`` channels); public calls run it with ``C = 1``.
+
+On a Blackwell device (capability 10.x) ``backend='auto'`` runs the composition
+on the native sliding-chunk reads (``sliding_chunk_attention._flash_sca_fwd`` /
+``_flash_sca_bwd`` with backend ``'auto'``, the native kernels), with the gate,
+restore and gradient-merge kernels of ``csrc/softdelta/gate.cu``: deterministic
+whatever ``deterministic`` says, as SCA is there. A causal call reads as one
+sliding chunk holding every key. Precision level 1 and sliding windows that do
+not cover every earlier key have no native route there and raise; nothing falls
+back to the PyTorch reference, which runs only when ``backend='torch'`` asks.
 """
 
 import functools
@@ -50,6 +59,7 @@ from ._backward_precision import allocate_backward_output_state, validate_high_p
 from ._bos_metadata import _bos_plan
 from ._bos_routing_heuristics import select_flash_swa_bos_routes
 from ._causal_attention import _dense_bwd, _dense_fwd, _extension_ops
+from ._native_dispatch import record_route
 from ._sca_segment_alignment import matched_backward, matched_forward, needs_matched_reset
 from ._segment_metadata import resolve_segment_indices, validate_segment_indices
 from .sliding_chunk_attention import _flash_sca_bwd, _flash_sca_fwd
@@ -242,16 +252,55 @@ def _normalize_backend(backend: str) -> str:
     return "auto" if normalized == "" else normalized
 
 
-def _use_sm90_backend(backend: str, q: Tensor, api_name: str = _API) -> bool:
-    """The backend rule with the device capability cached per device."""
+@functools.lru_cache(maxsize=None)
+def _native_device(index: int) -> bool:
+    """Capability 10.x and above: the devices whose sliding-chunk reads resolve to the native Blackwell
+    kernels (``_sca_native.selected``, which raises when the build or the device cannot run them)."""
+    return torch.cuda.get_device_capability(index)[0] >= 10
+
+
+def _native_reads(q: Tensor) -> bool:
+    return q.is_cuda and _native_device(q.get_device())
+
+
+def _route(backend: str, q: Tensor, api_name: str = _API) -> str:
+    """``'sm90'``, ``'native'`` or ``'torch'``, with the device capability cached per device.
+
+    ``auto`` takes SM90 on an SM90 device and, on a Blackwell device, the composition of the native
+    sliding-chunk reads with the gate and merge kernels; on other devices, as upstream, the reference.
+    ``sm90`` refuses every other device; ``torch`` is the reference wherever it is asked for.
+    """
     if backend == "torch":
-        return False
-    available = q.is_cuda and _sm90_device(q.get_device())
+        return "torch"
+    if q.is_cuda and _sm90_device(q.get_device()):
+        return "sm90"
     if backend == "sm90":
-        if not available:
-            raise RuntimeError(f"{api_name} requires an SM90 CUDA tensor")
-        return True
-    return available
+        raise RuntimeError(f"{api_name} requires an SM90 CUDA tensor")
+    return "native" if _native_reads(q) else "torch"
+
+
+def _native_local(q: Tensor, local: Optional[_Local], k_length: int) -> Optional[_Local]:
+    """The support of the native reads: a causal call reads as one sliding chunk holding every key (a
+    chunk of at least the K/V length puts every position in chunk 0, whose rule is the causal one)."""
+    if local is None and _native_reads(q):
+        return _Local(AttentionVisibility.SLIDING_CHUNK, max(k_length, 1))
+    return local
+
+
+def _native_level_refusal(api_name: str) -> NotImplementedError:
+    return NotImplementedError(
+        f"{api_name} high_precision_level=1 has no native Blackwell route: its reads need the FP32 "
+        "output state and the strict-past precision-repair backward, which the native kernels do not "
+        "implement; nothing was run. Use high_precision_level=0."
+    )
+
+
+def _native_window_refusal(api_name: str) -> NotImplementedError:
+    return NotImplementedError(
+        f"{api_name} has no native Blackwell route for a sliding window that does not cover every "
+        "earlier key: the native kernels read sliding chunks (and causal support as one chunk holding "
+        "every key); nothing was run. Pass backend='torch' for the reference."
+    )
 
 
 def _gate_combine(read: Tensor, neg_read: Tensor, g: Tensor) -> Tensor:
@@ -320,18 +369,20 @@ def _add_optional(a: Optional[Tensor], b: Optional[Tensor]) -> Optional[Tensor]:
 
 
 def _matched_reset(q, q_segment_idx, k_segment_idx, local: Optional[_Local]) -> bool:
-    return (local is not None and local.visibility == 2
+    # The native reads serve reset chunks whose Q ids are not K's suffix directly, FP32 dK / dV included.
+    return (local is not None and local.visibility == 2 and not _native_reads(q)
             and needs_matched_reset(q, q_segment_idx, k_segment_idx, local.reset))
 
 
 def _local_reader(q, k, v, local, scale, prev_k, prev_v, q_segment_idx, k_segment_idx, strict, deterministic,
                   *, state=None, dy=None, y=None, lse=None, fp32_kv_grads=False):
-    """One read over ``local`` support through the sliding window / chunk SM90 routes: the forward
-    ``(output, lse)`` (``state`` receives the FP32 output), or with ``dy`` / ``y`` / ``lse`` the
-    backward ``(dq, dk, dv, dprev_k, dprev_v)``, dK / dV unrounded in FP32 with ``fp32_kv_grads``
-    (grouped heads, not on matched reset chunks)."""
+    """One read over ``local`` support through the sliding window / chunk SM90 routes, or the native
+    sliding-chunk reads on Blackwell: the forward ``(output, lse)`` (``state`` receives the FP32
+    output), or with ``dy`` / ``y`` / ``lse`` the backward ``(dq, dk, dv, dprev_k, dprev_v)``, dK / dV
+    unrounded in FP32 with ``fp32_kv_grads`` (grouped heads, not on SM90 matched reset chunks)."""
     backward = dy is not None
     prefix = (dy, q, k, v, y, lse) if backward else (q, k, v)
+    backend = "auto" if _native_reads(q) else "sm90"
     if local.visibility == 2:
         if _matched_reset(q, q_segment_idx, k_segment_idx, local):
             if fp32_kv_grads:
@@ -350,9 +401,11 @@ def _local_reader(q, k, v, local, scale, prev_k, prev_v, q_segment_idx, k_segmen
             return output, out_lse
         args = (*prefix, local.span, scale, prev_k, prev_v, q_segment_idx, k_segment_idx)
         if backward:
-            return _flash_sca_bwd(*args, deterministic, "sm90", local.reset, strict_past=strict,
+            return _flash_sca_bwd(*args, deterministic, backend, local.reset, strict_past=strict,
                                   fp32_kv_grads=fp32_kv_grads)
-        return _flash_sca_fwd(*args, "sm90", local.reset, strict_past=strict, output_state=state)
+        return _flash_sca_fwd(*args, backend, local.reset, strict_past=strict, output_state=state)
+    if backend != "sm90":
+        raise _native_window_refusal(_API)
     args = (*prefix, local.span, scale, prev_k, prev_v, q_segment_idx, k_segment_idx)
     if backward:
         return _dense_bwd(*args, deterministic, "sm90", strict_past=strict, fp32_kv_grads=fp32_kv_grads)
@@ -377,6 +430,7 @@ def _forward(q, k, v, g, k_read, prev_k, prev_v, q_segment_idx, k_segment_idx, s
         k_read = _aligned_keys(k, length)
     ops = _extension_ops()
     g = g.contiguous()
+    local = _native_local(q, local, k.shape[1] + (0 if prev_k is None else prev_k.shape[1]))
     fused = _fused_ops(q, v, prev_k, local, k.shape[1])
     if fused is not None:
         q, k, flat_v, k_read = (_tma_readable(t) for t in (q, k, flat_v, k_read))
@@ -445,6 +499,7 @@ def _backward(y_grad, q, k, v, g, k_read, prev_k, prev_v, q_segment_idx, k_segme
         k_read = _aligned_keys(k, length)
     y_grad, g = y_grad.contiguous(), g.contiguous()
     ops = _extension_ops()
+    local = _native_local(q, local, k.shape[1] + (0 if prev_k is None else prev_k.shape[1]))
     fused = _fused_ops(q, v, prev_k, local, k.shape[1])
     if not level and not deterministic and fused is not None and length == k.shape[1]:
         q, k, flat_v, k_read = (_tma_readable(t) for t in (q, k, flat_v, k_read))
@@ -524,8 +579,9 @@ def _backward(y_grad, q, k, v, g, k_read, prev_k, prev_v, q_segment_idx, k_segme
 
 
 class _SoftDeltaFunc(torch.autograd.Function):
-    """SM90 reads (fused launch or composition), gate, and their backward. Level 0 saves ``y``
-    (the output itself), ``neg_read`` and the LSE; level 1 saves only the FP32 ``neg_read``."""
+    """SM90 reads (fused launch or composition) or the native Blackwell reads (composition), gate, and
+    their backward. Level 0 saves ``y`` (the output itself), ``neg_read`` and the LSE; level 1 saves
+    only the FP32 ``neg_read``."""
 
     @staticmethod
     def forward(
@@ -657,7 +713,8 @@ def _dispatch_nonpositive_scale(function, arguments):
 
 def _prepare(api_name, q, k, v, g, k_read, scale, prev_k, prev_v, q_segment_idx, k_segment_idx,
              segment_idx, bos_mask, backend, deterministic, high_precision_level, standalone):
-    """Validate a call: ``(q_segment_idx, k_segment_idx, resolved scale, SM90)``.
+    """Validate a call: ``(q_segment_idx, k_segment_idx, resolved scale, route)``, the route ``'sm90'``,
+    ``'native'`` or ``'torch'`` (``_route``).
 
     The level, scale and SM90 widths are checked before any tensor shape.
     """
@@ -669,16 +726,18 @@ def _prepare(api_name, q, k, v, g, k_read, scale, prev_k, prev_v, q_segment_idx,
     q_segment_idx, k_segment_idx = _prepare_segments(
         q, prev_length + k.shape[1], q_segment_idx, k_segment_idx, segment_idx, bos_mask, api_name,
     )
-    use_sm90 = _use_sm90_backend(backend, q, api_name)
-    if not use_sm90 and (standalone or high_precision_level):
+    route = _route(backend, q, api_name)
+    if route == "torch" and (standalone or high_precision_level):
         raise ValueError(
             f"{api_name} requires the SM90 CUDA backend"
             + ("" if standalone else " for high_precision_level=1")
         )
-    if use_sm90 and high_precision_level:
+    if route == "native" and high_precision_level:
+        raise _native_level_refusal(api_name)
+    if route == "sm90" and high_precision_level:
         from ._precision_backend import _ops as precision_ops
         precision_ops()
-    return q_segment_idx, k_segment_idx, resolve_scale(q, scale), use_sm90
+    return q_segment_idx, k_segment_idx, resolve_scale(q, scale), route
 
 
 _TENSORS = ("q", "k", "v", "g", "k_read", "prev_k", "prev_v")
@@ -689,9 +748,10 @@ _OPTIONS = ("q_segment_idx", "k_segment_idx", "segment_idx", "bos_mask", "backen
 def _prepare_call(function, kind, arguments, standalone):
     """``_prepare`` over a public call's arguments, then its local support (validated after the
     level, scale, widths and shapes): ``(tensors, local,
-    q_segment_idx, k_segment_idx, resolved scale, SM90)``. ``tensors`` holds ``v`` / ``g`` /
+    q_segment_idx, k_segment_idx, resolved scale, route)``. ``tensors`` holds ``v`` / ``g`` /
     ``prev_v`` in the internal value-group layout (``_grouped``); only the sliding chunk calls take
-    previous K/V. ``local`` is None for causal calls and for windows / chunks covering every earlier key."""
+    previous K/V. ``local`` is None for causal calls and for windows / chunks covering every earlier key.
+    One route record per call when the route trace is on (``_native_dispatch``)."""
     q, k, v, g, k_read, prev_k, prev_v = tuple(arguments.get(n) for n in _TENSORS)
     q_segment_idx, k_segment_idx, segment_idx, bos_mask, backend, deterministic, level = (
         arguments[n] for n in _OPTIONS
@@ -706,19 +766,25 @@ def _prepare_call(function, kind, arguments, standalone):
         raise ValueError(f"{function.__name__} prev_k/prev_v sequence length must equal chunk_size")
     v, g, prev_v = _grouped(v, g, prev_v)
     tensors = (q, k, v, g, k_read, prev_k, prev_v)
-    return (tensors, _effective_local(local, k.shape[1] + prev_length), *prepared)
+    local = _effective_local(local, k.shape[1] + prev_length)
+    route = prepared[-1]
+    if route == "native" and local is not None and local.visibility == 1:
+        raise _native_window_refusal(function.__name__)
+    record_route({"kind": "softdelta_route", "api_name": function.__name__, "resolved": route,
+                  "support": "causal" if local is None else local.kind.value})
+    return (tensors, local, *prepared)
 
 
 def _call(function, kind, arguments):
     """The autograd call of ``function`` over ``kind`` support."""
     if arguments["scale"] is not None and float(arguments["scale"]) <= 0:
         return _dispatch_nonpositive_scale(function, arguments)
-    tensors, local, q_segment_idx, k_segment_idx, resolved_scale, use_sm90 = _prepare_call(
+    tensors, local, q_segment_idx, k_segment_idx, resolved_scale, route = _prepare_call(
         function, kind, arguments, standalone=False,
     )
     q, k, v, g, k_read, prev_k, prev_v = tensors
     deterministic, level = arguments["deterministic"], arguments["high_precision_level"]
-    if not use_sm90:
+    if route == "torch":
         return _torch_softdelta(
             q, k, v, g, k_read, prev_k, prev_v, q_segment_idx, k_segment_idx, resolved_scale, local,
         ).flatten(3)
@@ -854,7 +920,7 @@ def softdelta_attention_fwd(
     deterministic: bool = False,
     high_precision_level: int = 0,
 ) -> Tuple[Tensor, Tensor, Tensor]:
-    """Return ``(y, neg_read, lse)`` without an autograd graph (SM90).
+    """Return ``(y, neg_read, lse)`` without an autograd graph (SM90; Blackwell at level 0).
 
     ``y`` ``[B, Lq, H, V]`` keeps the input dtype. ``neg_read``
     ``[B, Lq, Hkv, V]`` holds the negative reads, in the input dtype at level 0
@@ -888,7 +954,7 @@ def softdelta_attention_bwd(
     deterministic: bool = False,
     high_precision_level: int = 0,
 ) -> Tuple[Tensor, Tensor, Tensor, Tensor, Optional[Tensor]]:
-    """Return ``(dq, dk, dv, dg, dk_read)`` (SM90).
+    """Return ``(dq, dk, dv, dg, dk_read)`` (SM90; Blackwell at level 0).
 
     ``y``, ``neg_read`` and ``lse`` come from ``softdelta_attention_fwd`` with
     the same arguments; ``y_grad`` keeps the input dtype. Level 1 recomputes
