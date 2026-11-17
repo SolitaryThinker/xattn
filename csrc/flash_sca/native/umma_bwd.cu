@@ -14,6 +14,7 @@
 
 #include "flash_sca/native/dispatch_tag.cuh"
 #include "flash_sca/native/umma_bwd.h"
+#include "flash_sca/native/kv_companion.h"
 
 namespace xattn::ops::flash_sca_native {
 
@@ -592,6 +593,75 @@ void LaunchBackwardPhases(const Params& params, const umma::UmmaLaunchParams& na
                     products != 0);
     LegBoundary(kLegEnd, stream);
   }
+}
+
+// (promotion: main <- H9 + H8 + H4, bld1)
+bool SoftDeltaPairEligible(const Params& gp, const umma::UmmaLaunchParams& gnative,
+                           const BackwardPhases& gph, const Params& sp,
+                           const umma::UmmaLaunchParams& snative, const BackwardPhases& sph) {
+  (void)gnative;
+  (void)snative;
+  if (!gph.native.dq || !gph.native.dkdv || gph.native.dkdv_atomic_dq) return false;
+  if (!sph.native.dq || sph.native.dkdv_atomic_dq) return false;
+  if (gph.needs_dq_accumulator() || sph.needs_dq_accumulator()) return false;
+  if ((gph.generic_stages & ~static_cast<unsigned>(kStageDelta)) != 0) return false;
+  if (gp.prev_length != 0 || sp.prev_length != 0) return false;
+  umma::UmmaLaunchParams call = gnative;
+  call.params = gp;
+  return umma::CanLaunchUmmaBackwardKvPipeCompanion(call);
+}
+
+void LaunchSoftDeltaBackwardPhases(const Params& gp, const umma::UmmaLaunchParams& gnative,
+                                   const BackwardPhases& gph, const Params& sp,
+                                   const umma::UmmaLaunchParams& snative,
+                                   const BackwardPhases& sph, cudaStream_t stream) {
+  const char* reason = nullptr;
+  TORCH_CHECK(CheckBackwardPhases(gp, gnative, gph, &reason),
+              "native SoftDelta backward: invalid grouped launch plan: ", reason ? reason : "?");
+  TORCH_CHECK(CheckBackwardPhases(sp, snative, sph, &reason),
+              "native SoftDelta backward: invalid strict launch plan: ", reason ? reason : "?");
+  TORCH_CHECK(SoftDeltaPairEligible(gp, gnative, gph, sp, snative, sph),
+              "native SoftDelta backward: the pair launch was refused after commitment");
+  umma::UmmaLaunchParams gcall = gnative;
+  gcall.params = gp;
+  umma::UmmaLaunchParams scall = snative;
+  scall.params = sp;
+  // Both reads' delta, tile bounds and key tile ranges first: the key leaf reads the strict
+  // read's delta through the companion.
+  LaunchBackwardStages(sp, stream, kStageDelta);
+  LaunchBackwardStages(gp, stream, kStageDelta);
+  umma::KvCompanion comp{};
+  comp.q = snative.maps.q;
+  comp.dy = snative.maps.dy;
+  comp.lse = sp.lse_in;
+  comp.delta = sp.delta;
+  comp.row_lo = sp.row_lo;
+  comp.row_hi = sp.row_hi;
+  // The key leaf writes only dK/dV, each dQ leaf only its own dQ, none atomically: the three run
+  // on two streams and join before anything the caller enqueues next.
+  const c10::cuda::CUDAStream fork =
+      c10::cuda::getStreamFromPool(/*isHighPriority=*/false, c10::cuda::current_device());
+  cudaEvent_t ready = nullptr;
+  cudaEvent_t done = nullptr;
+  C10_CUDA_CHECK(cudaEventCreateWithFlags(&ready, cudaEventDisableTiming));
+  C10_CUDA_CHECK(cudaEventCreateWithFlags(&done, cudaEventDisableTiming));
+  C10_CUDA_CHECK(cudaEventRecord(ready, stream));
+  C10_CUDA_CHECK(cudaStreamWaitEvent(fork.stream(), ready, 0));
+  if (!ProductHasNoWork(umma::BackwardProduct::kDkdv, gp)) {
+    TORCH_CHECK(umma::LaunchUmmaBackwardKvPipeCompanion(gcall, comp, stream),
+                "native SoftDelta backward: companion key leaf refused after commitment");
+    RecordPhase(Phase::kDk, Body::kUmma, Body::kUmma, State::kRan);
+    RecordPhase(Phase::kDv, Body::kUmma, Body::kUmma, State::kRan);
+  } else {
+    RecordPhase(Phase::kDk, Body::kNone, Body::kNone, State::kSkipped);
+    RecordPhase(Phase::kDv, Body::kNone, Body::kNone, State::kSkipped);
+  }
+  LaunchLeaf(umma::BackwardProduct::kDq, gcall, fork.stream());
+  LaunchLeaf(umma::BackwardProduct::kDq, scall, fork.stream());
+  C10_CUDA_CHECK(cudaEventRecord(done, fork.stream()));
+  C10_CUDA_CHECK(cudaStreamWaitEvent(stream, done, 0));
+  C10_CUDA_CHECK(cudaEventDestroy(ready));
+  C10_CUDA_CHECK(cudaEventDestroy(done));
 }
 
 }  // namespace xattn::ops::flash_sca_native

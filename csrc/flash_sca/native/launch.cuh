@@ -109,9 +109,26 @@ inline void LaunchPreprocess(const Params& p, cudaStream_t stream) {
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
+// The tables-only form of LaunchPreprocess, for a call whose delta another body already wrote
+// (p.saved null, p.delta set: the SoftDelta pair backward, whose gate backward emits both reads'
+// deltas): the tile bounds (one CTA per 64-row tile) and then the key tile range (one CTA per
+// 64-key tile), the same exact min/max tables the preprocess's block (0, 0, b) computes, spread
+// over the GPU instead of one block per batch row; no delta is computed or written.
+template <typename E>
+inline void LaunchPreprocessTables(const Params& p, cudaStream_t stream) {
+  Params mutable_p = p;
+  LaunchTileBounds(mutable_p, stream);
+  if (p.key_tile_range != nullptr) LaunchKeyTileRange(mutable_p, stream);
+}
+
 template <typename E>
 void BackwardDeltaStage(const Params& p, cudaStream_t stream) {
   const int64_t rows = p.batch * p.q_length * p.query_heads;
+  if (rows > 0 && p.saved == nullptr && p.delta != nullptr && p.tile_bounds != nullptr) {
+    LaunchPreprocessTables<E>(p, stream);
+    RecordPhase(Phase::kDelta, Body::kScalar, Body::kScalar, State::kRan);
+    return;
+  }
   // Vector path: 16-B loads need dy and saved contiguous, 16-B aligned and a
   // value dim that is a multiple of 8 (every bucket dim is). Otherwise the seed's
   // scalar delta kernel runs, with the two table kernels beside it.

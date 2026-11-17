@@ -111,4 +111,18 @@ void LaunchRowBoundsFromBos(const unsigned char* bos, int32_t* lo, int32_t* hi,
                             int32_t chunk_size, bool strict_past, bool reset,
                             cudaStream_t stream);
 
+// H25: the segment ids a packed-sequence BOS mask names (one int64 per key, the count of BOS
+// positions at or before it: the same values as `bos_mask.cumsum(dim=1, dtype=torch.int64)`,
+// bit for bit -- an inclusive integer prefix sum, so there is only one correct result and every
+// sound scan gives it). SoftDelta's composed backward passes these ids (not the mask) to its
+// private reads, which read a per-key segment id on chip (SegmentTest / `p.q_segment`,
+// `p.k_segment`); building them with torch's generic scan measured 53-58 us/call (one launch,
+// shared by both reads since D7/H9), independent of the mask's visible-key share. One block per
+// batch row, a two-pass block scan (every thread's own contiguous run, then a block-wide
+// Hillis-Steele scan of the per-thread totals): batch is at most a few dozen for any shape the
+// API accepts, so a few blocks finish in microseconds.
+void LaunchSegmentIdsFromBos(const unsigned char* bos, int64_t* ids, int64_t batch,
+                             int64_t total, cudaStream_t stream);
+// (sha marker)
+
 }  // namespace xattn::ops::flash_sca_native

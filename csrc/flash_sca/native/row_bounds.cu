@@ -110,6 +110,46 @@ __global__ void RowBoundsKernel(const unsigned char* __restrict__ bos,
   hi_out[at] = static_cast<int32_t>(p - strict);
 }
 
+// H25: one block per batch row scans that row's BOS mask into an inclusive int64 prefix sum
+// (the segment id of every key): each thread sums its own contiguous run of the mask, then a
+// block-wide Hillis-Steele scan of the kScanThreads per-thread totals gives every thread's
+// exclusive base, and a second pass over the same run adds it in and writes the result. Integer
+// counts: any correct scan gives the exact same bits as torch's cumsum, so this needs no
+// tolerance and no fallback to agree with it.
+constexpr int kScanThreads = 1024;
+
+__global__ void SegmentIdsFromBosKernel(const unsigned char* __restrict__ bos,
+                                        int64_t* __restrict__ ids, int64_t total) {
+  __shared__ int64_t s_block[kScanThreads];
+  const int64_t b = blockIdx.x;
+  const unsigned char* row = bos + b * total;
+  int64_t* out = ids + b * total;
+  const int tid = threadIdx.x;
+  const int64_t per = (total + kScanThreads - 1) / kScanThreads;
+  const int64_t start = tid * per;
+  const int64_t end = min(start + per, total);
+
+  int64_t local = 0;
+  for (int64_t i = start; i < end; ++i) local += row[i] != 0 ? 1 : 0;
+  s_block[tid] = local;
+  __syncthreads();
+
+#pragma unroll
+  for (int offset = 1; offset < kScanThreads; offset <<= 1) {
+    int64_t val = s_block[tid];
+    if (tid >= offset) val += s_block[tid - offset];
+    __syncthreads();
+    s_block[tid] = val;
+    __syncthreads();
+  }
+
+  int64_t running = tid == 0 ? 0 : s_block[tid - 1];
+  for (int64_t i = start; i < end; ++i) {
+    running += row[i] != 0 ? 1 : 0;
+    out[i] = running;
+  }
+}
+
 }  // namespace
 
 void LaunchRowBoundsFromBos(const unsigned char* bos, int32_t* lo, int32_t* hi, int64_t batch,
@@ -120,6 +160,14 @@ void LaunchRowBoundsFromBos(const unsigned char* bos, int32_t* lo, int32_t* hi, 
   RowBoundsKernel<<<grid, kRowsPerBlock, 0, stream>>>(bos, lo, hi, total, q_length, shift,
                                                       chunk_size, strict_past ? 1 : 0,
                                                       reset ? 1 : 0);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+void LaunchSegmentIdsFromBos(const unsigned char* bos, int64_t* ids, int64_t batch,
+                             int64_t total, cudaStream_t stream) {
+  if (batch <= 0 || total <= 0) return;
+  SegmentIdsFromBosKernel<<<static_cast<unsigned>(batch), kScanThreads, 0, stream>>>(bos, ids,
+                                                                                     total);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 

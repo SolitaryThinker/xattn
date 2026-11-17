@@ -91,4 +91,17 @@ int BwdLegTimerDropped();                        // slots lost: device had not c
 void LaunchBackwardPhases(const Params& params, const umma::UmmaLaunchParams& native,
                           const BackwardPhases& phases, cudaStream_t stream);
 
+// The native SoftDelta pair backward (kv_companion.h): the grouped read `g*` and the strict read
+// `s*` over the same K/V. Eligible when both dQ leaves and the grouped key leaf are native, no
+// accumulator and no generic product is needed, no previous K/V, and the companion key leaf's
+// preflight accepts the grouped call. The launch: both deltas, then one key leaf for both reads
+// (dK/dV of their sum, rounded once) beside the two dQ leaves.
+bool SoftDeltaPairEligible(const Params& gp, const umma::UmmaLaunchParams& gnative,
+                           const BackwardPhases& gph, const Params& sp,
+                           const umma::UmmaLaunchParams& snative, const BackwardPhases& sph);
+void LaunchSoftDeltaBackwardPhases(const Params& gp, const umma::UmmaLaunchParams& gnative,
+                                   const BackwardPhases& gph, const Params& sp,
+                                   const umma::UmmaLaunchParams& snative,
+                                   const BackwardPhases& sph, cudaStream_t stream);
+
 }  // namespace xattn::ops::flash_sca_native

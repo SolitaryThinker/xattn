@@ -292,6 +292,179 @@ __global__ void SoftDeltaGateBwdKernel(
   }
 }
 
+// As SoftDeltaGateBwdKernel, but also recovers the read (y_in + sigmoid(gate) * neg_read, the
+// value SoftDeltaGateRestore computes) in the same per-(kv_row, r) pass: y_in and the gate are
+// already resident for the gate-gradient reduction, so writing the restored read here costs one
+// more load (y_in) and one more store per round instead of a second kernel's full re-read of
+// neg_read and gate. y_in may be a head slice of the forward's packed readers (as in
+// SoftDeltaGateRestore); read_out is a fresh contiguous [B, L, H, C, Dg] tensor, dy's layout.
+template <typename T, typename StateT, int kVec, int kSubwarp, int kChunks>
+__global__ void __launch_bounds__(kThreads) SoftDeltaGateBwdRestoreKernel(
+    const T* __restrict__ dy, const StateT* __restrict__ neg_read,
+    const T* __restrict__ gate, const T* __restrict__ y_in,
+    T* __restrict__ neg_read_grad, T* __restrict__ gate_grad, T* __restrict__ read_out,
+    int64_t kv_rows, int groups, int kv_heads, int rep, int group_dim, GateStrides strides) {
+  const int lane = threadIdx.x % kWarpSize;
+  const int sublane = lane % kSubwarp;
+  const int64_t kv_row = (int64_t(blockIdx.x) * blockDim.x + threadIdx.x) / kSubwarp;
+  const bool active = kv_row < kv_rows;
+  const int c = active ? int(kv_row % groups) : 0;
+  const int64_t kv_head_row = kv_row / groups;
+  const int kv = int(kv_head_row % kv_heads);
+  const int64_t bt = kv_head_row / kv_heads;
+  const int q_heads = kv_heads * rep;
+
+  float negv[kChunks][kVec], acc[kChunks][kVec];
+#pragma unroll
+  for (int chunk = 0; chunk < kChunks; ++chunk) {
+    const int column = (chunk * kSubwarp + sublane) * kVec;
+#pragma unroll
+    for (int i = 0; i < kVec; ++i) { negv[chunk][i] = 0.0f; acc[chunk][i] = 0.0f; }
+    if (active && column < group_dim) {
+      LoadVec<StateT, kVec>(neg_read + bt * strides.neg_bt + kv * strides.neg_kv +
+                                int64_t(c) * group_dim + column,
+                            negv[chunk]);
+    }
+  }
+  for (int r = 0; r < rep; ++r) {
+    const int64_t row = (bt * q_heads + kv * rep + r) * groups + c;
+    const int64_t y_base = bt * strides.read_bt + kv * strides.read_kv + int64_t(r) * strides.read_r +
+                           int64_t(c) * group_dim;
+    const float gate_value = active ? Sigmoid(static_cast<float>(gate[row])) : 0.0f;
+    float projection = 0.0f;
+#pragma unroll
+    for (int chunk = 0; chunk < kChunks; ++chunk) {
+      const int column = (chunk * kSubwarp + sublane) * kVec;
+      if (active && column < group_dim) {
+        float grad[kVec], restored[kVec];
+        LoadVec<T, kVec>(dy + row * group_dim + column, grad);
+        LoadVec<T, kVec>(y_in + y_base + column, restored);
+#pragma unroll
+        for (int i = 0; i < kVec; ++i) {
+          acc[chunk][i] += gate_value * grad[i];
+          projection += grad[i] * negv[chunk][i];
+          restored[i] += gate_value * negv[chunk][i];
+        }
+        StoreVec<T, kVec>(read_out + row * group_dim + column, restored);
+      }
+    }
+#pragma unroll
+    for (int offset = kSubwarp / 2; offset > 0; offset /= 2) {
+      projection += __shfl_xor_sync(0xffffffff, projection, offset, kSubwarp);
+    }
+    if (active && sublane == 0) {
+      gate_grad[row] = static_cast<T>(-gate_value * (1.0f - gate_value) * projection);
+    }
+  }
+  if (!active) {
+    return;
+  }
+#pragma unroll
+  for (int chunk = 0; chunk < kChunks; ++chunk) {
+    const int column = (chunk * kSubwarp + sublane) * kVec;
+    if (column < group_dim) {
+#pragma unroll
+      for (int i = 0; i < kVec; ++i) acc[chunk][i] = -acc[chunk][i];
+      StoreVec<T, kVec>(neg_read_grad + kv_row * group_dim + column, acc[chunk]);
+    }
+  }
+}
+
+// SoftDeltaGateBwdRestoreKernel's pass with the restored read consumed in place instead of stored:
+// it writes the two reads' backward deltas, the values PreprocessBackwardKernel
+// (flash_sca/native/kernels.cuh) would compute from the restored read and from the negative read,
+//   delta_read[b, h, t]  = sum_c dy[b, t, h, c] * read[b, t, h, c]                 ([B, H, L])
+//   delta_neg[b, kv, t]  = sum_c neg_read_grad[b, t, kv, c] * neg_read[b, t, kv, c] ([B, Hkv, L])
+// over the 16-bit values that kernel would load (read and neg_read_grad rounded to T as their
+// stores round them), in its order: lane l of the kLanes lanes of a row sums columns 8 l .. 8 l + 7
+// in turn (sum += x * y from 0), then the lanes are reduced by xor shuffles kLanes / 2, ..., 1. That
+// is its layout exactly when V == 8 kLanes (one value group, kLanes = 8, 16 or 32, which
+// LaunchPreprocess picks for V = 64, 128, 256); the launcher takes only those, so the deltas are
+// bit-equal to the preprocessing's and the read is never written.
+//
+// Latency, not bandwidth, limits this pass (ncu: L1TEX scoreboard stalls, 55% of DRAM peak at 56
+// registers and half occupancy), so it is built for more rows in flight: at most 40 registers
+// (6 blocks of 256 threads per SM) and every row the lane will read requested into L2 before the
+// head loop. Neither changes an operation or its order.
+constexpr int kGateDeltaMinBlocks = 6;
+
+template <typename T, int kLanes>
+__global__ void __launch_bounds__(kThreads, kGateDeltaMinBlocks) SoftDeltaGateBwdDeltaKernel(
+    const T* __restrict__ dy, const T* __restrict__ neg_read, const T* __restrict__ gate,
+    const T* __restrict__ y_in, T* __restrict__ neg_read_grad, T* __restrict__ gate_grad,
+    float* __restrict__ delta_read, float* __restrict__ delta_neg, int64_t kv_rows, int kv_heads,
+    int rep, int64_t length, GateStrides strides) {
+  constexpr int kVec = 8;
+  constexpr int kWidth = kVec * kLanes;  // V
+  const int sub = threadIdx.x % kLanes;
+  const int64_t kv_row = (int64_t(blockIdx.x) * blockDim.x + threadIdx.x) / kLanes;
+  const bool active = kv_row < kv_rows;
+  const int64_t r_kv = active ? kv_row : 0;  // dead groups compute row 0 and store nothing
+  const int kv = int(r_kv % kv_heads);
+  const int64_t bt = r_kv / kv_heads;
+  const int64_t b = bt / length;
+  const int64_t t = bt - b * length;
+  const int q_heads = kv_heads * rep;
+  const int column = sub * kVec;
+
+  float negv[kVec], acc[kVec];
+  LoadVec<T, kVec>(neg_read + bt * strides.neg_bt + kv * strides.neg_kv + column, negv);
+#pragma unroll
+  for (int i = 0; i < kVec; ++i) acc[i] = 0.0f;
+  // Every row this lane will read, requested into L2 up front (no value is read here).
+  for (int r = 0; r < rep; ++r) {
+    const int64_t row = bt * q_heads + kv * rep + r;
+    const int64_t y_base = bt * strides.read_bt + kv * strides.read_kv + int64_t(r) * strides.read_r;
+    asm volatile("prefetch.global.L2 [%0];" ::"l"(dy + row * kWidth + column));
+    asm volatile("prefetch.global.L2 [%0];" ::"l"(y_in + y_base + column));
+  }
+  for (int r = 0; r < rep; ++r) {
+    const int h = kv * rep + r;
+    const int64_t row = bt * q_heads + h;
+    const int64_t y_base = bt * strides.read_bt + kv * strides.read_kv + int64_t(r) * strides.read_r;
+    const float gate_value = Sigmoid(static_cast<float>(gate[row]));
+    float grad[kVec], restored[kVec];
+    LoadVec<T, kVec>(dy + row * kWidth + column, grad);
+    LoadVec<T, kVec>(y_in + y_base + column, restored);
+    float projection = 0.0f;
+#pragma unroll
+    for (int i = 0; i < kVec; ++i) {
+      acc[i] += gate_value * grad[i];
+      projection += grad[i] * negv[i];
+      restored[i] += gate_value * negv[i];
+    }
+    float delta = 0.0f;
+#pragma unroll
+    for (int i = 0; i < kVec; ++i) {
+      delta += grad[i] * static_cast<float>(static_cast<T>(restored[i]));
+    }
+#pragma unroll
+    for (int offset = kLanes / 2; offset > 0; offset /= 2) {
+      projection += __shfl_xor_sync(0xffffffff, projection, offset);
+      delta += __shfl_xor_sync(0xffffffff, delta, offset);
+    }
+    if (active && sub == 0) {
+      gate_grad[row] = static_cast<T>(-gate_value * (1.0f - gate_value) * projection);
+      delta_read[(b * q_heads + h) * length + t] = delta;
+    }
+  }
+  float out[kVec];
+#pragma unroll
+  for (int i = 0; i < kVec; ++i) out[i] = static_cast<float>(static_cast<T>(-acc[i]));
+  float delta = 0.0f;
+#pragma unroll
+  for (int i = 0; i < kVec; ++i) delta += out[i] * negv[i];
+#pragma unroll
+  for (int offset = kLanes / 2; offset > 0; offset /= 2) {
+    delta += __shfl_xor_sync(0xffffffff, delta, offset);
+  }
+  if (!active) {
+    return;
+  }
+  StoreVec<T, kVec>(neg_read_grad + kv_row * kWidth + column, out);
+  if (sub == 0) delta_neg[(b * kv_heads + kv) * length + t] = delta;
+}
+
 // out[i] = acc[i] + other[i] (+ extra[row - extra_row_offset] on rows >= extra_row_offset), 8 elements
 // per thread when aligned; acc is out (in place) or an FP32 accumulator. Rows are the per-batch time
 // index; row_elems = Hkv * D.
@@ -367,6 +540,73 @@ void LaunchBwd(const torch::Tensor& dy, const torch::Tensor& neg_read, const tor
           reinterpret_cast<T*>(neg_read_grad.data_ptr()),
           reinterpret_cast<T*>(gate_grad.data_ptr()),
           shape.rows, shape.groups, shape.heads, shape.rep, shape.group_dim, shape.strides);
+}
+
+template <typename T, typename StateT, int kVec, int kSubwarp, int kChunks>
+void LaunchBwdRestore(const torch::Tensor& dy, const torch::Tensor& y, const torch::Tensor& neg_read,
+                      const torch::Tensor& gate, torch::Tensor& neg_read_grad, torch::Tensor& gate_grad,
+                      torch::Tensor& read_out, const GateShape& shape, cudaStream_t stream) {
+  const int64_t threads = shape.rows * kSubwarp;
+  SoftDeltaGateBwdRestoreKernel<T, StateT, kVec, kSubwarp, kChunks>
+      <<<int((threads + kThreads - 1) / kThreads), kThreads, 0, stream>>>(
+          reinterpret_cast<const T*>(dy.data_ptr()),
+          reinterpret_cast<const StateT*>(neg_read.data_ptr()),
+          reinterpret_cast<const T*>(gate.data_ptr()),
+          reinterpret_cast<const T*>(y.data_ptr()),
+          reinterpret_cast<T*>(neg_read_grad.data_ptr()),
+          reinterpret_cast<T*>(gate_grad.data_ptr()),
+          reinterpret_cast<T*>(read_out.data_ptr()),
+          shape.rows, shape.groups, shape.heads, shape.rep, shape.group_dim, shape.strides);
+}
+
+// Dispatch by group width (kVec = 8 vectors when every row start is 16-byte aligned, 1 element
+// per lane otherwise) and by neg_read's state type (StateT: FP32 when fp32_state, else T).
+template <typename T>
+void DispatchBwdRestore(bool fp32_state, int group_dim, bool aligned, const torch::Tensor& dy,
+                        const torch::Tensor& y, const torch::Tensor& neg_read, const torch::Tensor& gate,
+                        torch::Tensor& neg_read_grad, torch::Tensor& gate_grad, torch::Tensor& read_out,
+                        const GateShape& shape, cudaStream_t stream) {
+  auto run = [&](auto state_tag) {
+    using StateT = decltype(state_tag);
+    if (aligned && group_dim % 8 == 0) {
+      switch (NextPowerOfTwo(group_dim / 8)) {
+        case 1:
+          LaunchBwdRestore<T, StateT, 8, 1, 1>(dy, y, neg_read, gate, neg_read_grad, gate_grad, read_out,
+                                               shape, stream);
+          return;
+        case 2:
+          LaunchBwdRestore<T, StateT, 8, 2, 1>(dy, y, neg_read, gate, neg_read_grad, gate_grad, read_out,
+                                               shape, stream);
+          return;
+        case 4:
+          LaunchBwdRestore<T, StateT, 8, 4, 1>(dy, y, neg_read, gate, neg_read_grad, gate_grad, read_out,
+                                               shape, stream);
+          return;
+        case 8:
+          LaunchBwdRestore<T, StateT, 8, 8, 1>(dy, y, neg_read, gate, neg_read_grad, gate_grad, read_out,
+                                               shape, stream);
+          return;
+        case 16:
+          LaunchBwdRestore<T, StateT, 8, 16, 1>(dy, y, neg_read, gate, neg_read_grad, gate_grad, read_out,
+                                                shape, stream);
+          return;
+        case 32:
+          LaunchBwdRestore<T, StateT, 8, 32, 1>(dy, y, neg_read, gate, neg_read_grad, gate_grad, read_out,
+                                                shape, stream);
+          return;
+        default:
+          break;
+      }
+    }
+    TORCH_CHECK(group_dim <= 256, "softdelta gate group dimension must be <= 256");
+    LaunchBwdRestore<T, StateT, 1, 32, 8>(dy, y, neg_read, gate, neg_read_grad, gate_grad, read_out, shape,
+                                          stream);
+  };
+  if (fp32_state) {
+    run(float{});
+  } else {
+    run(T{});
+  }
 }
 
 // Launcher selection by group width: kVec = 8 vectors when every row start is
@@ -565,15 +805,24 @@ torch::Tensor SoftDeltaGateFwd(const torch::Tensor& read, const torch::Tensor& n
 }
 
 torch::Tensor SoftDeltaGateRestore(const torch::Tensor& y, const torch::Tensor& neg_read,
-                                   const torch::Tensor& gate) {
+                                   const torch::Tensor& gate,
+                                   const c10::optional<torch::Tensor>& precomputed) {
+  // SoftDeltaGateBwd's fused call (given y) already wrote this value in the same pass as the
+  // gate backward; returning it here with no kernel launch keeps the two-call sequence
+  // (gate_bwd then gate_restore) that callers, route traces and launch counts see, at the cost of
+  // one Python/C++ crossing instead of a second kernel re-reading neg_read and gate.
+  if (precomputed.has_value()) {
+    return precomputed.value();
+  }
   const c10::cuda::CUDAGuard guard(gate.device());
   torch::Tensor read = torch::empty(y.sizes(), gate.options());
   GateCombine(y, neg_read, gate, read, -1.0f);
   return read;
 }
 
-std::tuple<torch::Tensor, torch::Tensor> SoftDeltaGateBwd(
-    const torch::Tensor& dy, const torch::Tensor& neg_read, const torch::Tensor& gate) {
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> SoftDeltaGateBwd(
+    const torch::Tensor& dy, const torch::Tensor& neg_read, const torch::Tensor& gate,
+    const c10::optional<torch::Tensor>& y) {
   CheckGate(dy, neg_read, gate);
   TORCH_CHECK(dy.is_contiguous() && dy.scalar_type() == gate.scalar_type(),
               "softdelta dy must be contiguous in the gate dtype");
@@ -583,13 +832,33 @@ std::tuple<torch::Tensor, torch::Tensor> SoftDeltaGateBwd(
   auto gate_grad = torch::empty(gate.sizes(), gate.options());
   const int group_dim = int(dy.size(4));
   const int kv_heads = int(neg_read.size(2));
+  const int rep = int(dy.size(2)) / kv_heads;
   const int64_t row = dy.size(3) * group_dim;
-  const GateShape shape{neg_read_grad.numel() / group_dim, int(dy.size(3)), kv_heads,
-                        int(dy.size(2)) / kv_heads, group_dim,
-                        GateStrides{0, 0, 0, neg_bt, row, 0}};
-  const bool aligned = Aligned16(dy) && RowsAligned16(neg_read, neg_bt) && Aligned16(neg_read_grad);
   const bool fp32_state = neg_read.scalar_type() == at::kFloat;
   cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+  if (y.has_value()) {
+    TORCH_CHECK(y->sizes() == dy.sizes() && y->scalar_type() == gate.scalar_type() &&
+                    y->device() == gate.device(),
+                "softdelta gate fused y must share dy's shape, device and the gate dtype");
+    const int64_t y_bt = RowStride(*y, "y");
+    auto read_out = torch::empty(dy.sizes(), gate.options());
+    const GateShape shape{neg_read_grad.numel() / group_dim, int(dy.size(3)), kv_heads, rep, group_dim,
+                          GateStrides{y_bt, rep * row, row, neg_bt, row, 0}};
+    const bool aligned = Aligned16(dy) && RowsAligned16(neg_read, neg_bt) && Aligned16(neg_read_grad) &&
+                         RowsAligned16(*y, y_bt) && Aligned16(read_out);
+    if (gate.scalar_type() == at::kHalf) {
+      DispatchBwdRestore<half>(fp32_state, group_dim, aligned, dy, *y, neg_read, gate, neg_read_grad,
+                               gate_grad, read_out, shape, stream);
+    } else {
+      DispatchBwdRestore<nv_bfloat16>(fp32_state, group_dim, aligned, dy, *y, neg_read, gate,
+                                      neg_read_grad, gate_grad, read_out, shape, stream);
+    }
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    return {neg_read_grad, gate_grad, read_out};
+  }
+  const GateShape shape{neg_read_grad.numel() / group_dim, int(dy.size(3)), kv_heads, rep, group_dim,
+                        GateStrides{0, 0, 0, neg_bt, row, 0}};
+  const bool aligned = Aligned16(dy) && RowsAligned16(neg_read, neg_bt) && Aligned16(neg_read_grad);
   if (gate.scalar_type() == at::kHalf) {
     DispatchState<half, false>(fp32_state, group_dim, aligned, dy, neg_read, gate,
                                neg_read_grad, gate_grad, shape, stream);
@@ -598,7 +867,67 @@ std::tuple<torch::Tensor, torch::Tensor> SoftDeltaGateBwd(
                                       neg_read_grad, gate_grad, shape, stream);
   }
   C10_CUDA_KERNEL_LAUNCH_CHECK();
-  return {neg_read_grad, gate_grad};
+  return {neg_read_grad, gate_grad, torch::Tensor()};
+}
+
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor> SoftDeltaGateBwdDeltas(
+    const torch::Tensor& dy, const torch::Tensor& neg_read, const torch::Tensor& gate,
+    const torch::Tensor& y) {
+  CheckGate(dy, neg_read, gate);
+  const c10::cuda::CUDAGuard guard(dy.device());
+  // The one layout whose deltas are bit-equal to the preprocessing's (see the kernel): one value
+  // group of V = 64, 128 or 256, 16-bit neg_read, every row 16-byte aligned. Otherwise nothing
+  // runs and four undefined tensors come back: the caller takes the restore route.
+  const int group_dim = int(dy.size(4));
+  const bool shape_ok = dy.size(3) == 1 && (group_dim == 64 || group_dim == 128 || group_dim == 256) &&
+                        neg_read.scalar_type() == gate.scalar_type() && dy.is_contiguous() &&
+                        dy.scalar_type() == gate.scalar_type() && y.sizes() == dy.sizes() &&
+                        y.scalar_type() == gate.scalar_type() && y.device() == gate.device();
+  if (!shape_ok) {
+    return {torch::Tensor(), torch::Tensor(), torch::Tensor(), torch::Tensor()};
+  }
+  const int64_t neg_bt = RowStride(neg_read, "neg_read");
+  const int64_t y_bt = RowStride(y, "y");
+  if (!(Aligned16(dy) && RowsAligned16(neg_read, neg_bt) && RowsAligned16(y, y_bt))) {
+    return {torch::Tensor(), torch::Tensor(), torch::Tensor(), torch::Tensor()};
+  }
+  const int64_t batch = dy.size(0), length = dy.size(1);
+  const int kv_heads = int(neg_read.size(2));
+  const int q_heads = int(dy.size(2));
+  const int rep = q_heads / kv_heads;
+  auto neg_read_grad = torch::empty(neg_read.sizes(), gate.options());
+  auto gate_grad = torch::empty(gate.sizes(), gate.options());
+  auto f32 = gate.options().dtype(at::kFloat);
+  auto delta_read = torch::empty({batch, q_heads, length}, f32);
+  auto delta_neg = torch::empty({batch, kv_heads, length}, f32);
+  const int64_t row = group_dim;
+  const GateStrides strides{y_bt, rep * row, row, neg_bt, row, 0};
+  const int64_t kv_rows = batch * length * kv_heads;
+  cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+  auto launch = [&](auto t_tag, auto lanes_tag) {
+    using T = decltype(t_tag);
+    constexpr int kLanes = decltype(lanes_tag)::value;
+    const int64_t threads = kv_rows * kLanes;
+    SoftDeltaGateBwdDeltaKernel<T, kLanes>
+        <<<int((threads + kThreads - 1) / kThreads), kThreads, 0, stream>>>(
+            reinterpret_cast<const T*>(dy.data_ptr()), reinterpret_cast<const T*>(neg_read.data_ptr()),
+            reinterpret_cast<const T*>(gate.data_ptr()), reinterpret_cast<const T*>(y.data_ptr()),
+            reinterpret_cast<T*>(neg_read_grad.data_ptr()), reinterpret_cast<T*>(gate_grad.data_ptr()),
+            delta_read.data_ptr<float>(), delta_neg.data_ptr<float>(), kv_rows, kv_heads, rep, length,
+            strides);
+  };
+  auto by_width = [&](auto t_tag) {
+    if (group_dim == 64) launch(t_tag, std::integral_constant<int, 8>{});
+    else if (group_dim == 128) launch(t_tag, std::integral_constant<int, 16>{});
+    else launch(t_tag, std::integral_constant<int, 32>{});
+  };
+  if (gate.scalar_type() == at::kHalf) {
+    by_width(half{});
+  } else {
+    by_width(nv_bfloat16{});
+  }
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  return {neg_read_grad, gate_grad, delta_read, delta_neg};
 }
 
 std::tuple<torch::Tensor, torch::Tensor> SoftDeltaMergeGradients(

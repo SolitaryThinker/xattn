@@ -208,7 +208,19 @@ def _prepare_segments(
                 f"{api_name} bos_mask must be a bool tensor on the input device "
                 f"with shape {[q.shape[0], k_length]}"
             )
-        k_segment_idx = bos_mask.cumsum(dim=1, dtype=torch.int64)
+        # H25: the native scan (one launch, built for this call) gives the same ids
+        # bos_mask.cumsum(dim=1, dtype=torch.int64) does, bit for bit (an integer prefix sum
+        # has one correct result) -- about 53-58 us/call faster than torch's generic scan
+        # kernel. Falls back to cumsum when the extension lacks the op or the mask is not CUDA
+        # (torch='backend', CPU tests): never a behavior change, only where the bits come from.
+        if bos_mask.is_cuda:
+            ops = _extension_ops()
+            if hasattr(ops, "_flash_sca_segment_ids_from_bos"):
+                k_segment_idx = ops._flash_sca_segment_ids_from_bos(bos_mask.contiguous())
+            else:
+                k_segment_idx = bos_mask.cumsum(dim=1, dtype=torch.int64)
+        else:
+            k_segment_idx = bos_mask.cumsum(dim=1, dtype=torch.int64)
         return k_segment_idx[:, k_length - q.shape[1]:].contiguous(), k_segment_idx
     q_segment_idx, k_segment_idx = resolve_segment_indices(
         segment_idx, q_segment_idx, k_segment_idx,
@@ -499,7 +511,7 @@ def _forward(q, k, v, g, k_read, prev_k, prev_v, q_segment_idx, k_segment_idx, s
 
 
 def _backward(y_grad, q, k, v, g, k_read, prev_k, prev_v, q_segment_idx, k_segment_idx,
-              y, neg_read, lse, scale, deterministic, level, local=None):
+              y, neg_read, lse, scale, deterministic, level, local=None, bos_mask=None):
     """``(dq, dk, dv, dg, dk_read, dprev_k, dprev_v)`` from the forward's ``y``, ``neg_read`` and LSE.
 
     ``dk_read`` is None when ``k_read`` is (the aligned keys' query-side gradient is in ``dk``).
@@ -507,6 +519,13 @@ def _backward(y_grad, q, k, v, g, k_read, prev_k, prev_v, q_segment_idx, k_segme
     launch, which reads the query reads' dPsum from ``y`` and ``neg_read``. The others run the gate
     backward, then each read's backward, summed in FP32 at level 1 (the precision-repair backward,
     which reads neither ``y`` nor the LSE); level 0 recovers the query reads from ``y``.
+
+    ``bos_mask``, when the call's own BOS mask (not a resolved segment id), lets the native pair
+    call re-derive both reads' row bounds from the mask on device (one launch each, already how the
+    forward's native route works) instead of the segment-id chain over the ids ``q_segment_idx`` /
+    ``k_segment_idx`` already resolved for every other path: ``q_segment_idx`` / ``k_segment_idx``
+    stay the composition's ids for every other reader. Only the standalone call (the fused Gekko
+    block's route) passes it; autograd's saved ids keep the prior path unchanged.
     """
     if level and _native_reads(q):
         raise _native_level_refusal(_API)
@@ -529,7 +548,29 @@ def _backward(y_grad, q, k, v, g, k_read, prev_k, prev_v, q_segment_idx, k_segme
             q_segment_idx, k_segment_idx, fold_k_read, _BWD_READER_GROUPS, *_fused_local_args(local),
         )
         return dq, dk, dv.view(v.shape), dg, None if fold_k_read else dk_read, None, None
-    neg_read_grad, dg = ops._softdelta_gate_bwd(y_grad, neg_read, g)
+    # Level 0 fuses the restore into this call (the third return, used below): both read neg_read
+    # and gate, so writing the restored read here, while they are already resident for the gate
+    # gradient, costs one more load and store per round instead of a second kernel's full re-read
+    # of them. Level 1 has no use for it (its y is not saved) and gets the unfused call.
+    # The native pair route (both reads in one call, below) at the layouts the gate backward can
+    # give both reads' preprocessing deltas for: then the restored read is never materialized and
+    # the pair's preprocessing writes only its tile tables.
+    pair_route = (not level and local is not None and local.visibility == 2 and not fold_k_read
+                  and prev_k is None and q_heads > kv_heads and _native_reads(q))
+    deltas = None
+    gate_neg_read = neg_read
+    # The pair's key leaf (the strict read as its companion) is built for the D = Dv = 128 bucket
+    # only, one value group: elsewhere the pair declines whatever it is given, so the gate backward
+    # takes the restore form at once rather than computing deltas that would go unused.
+    if pair_route and q.shape[-1] == 128 and groups == 1 and group_dim == 128:
+        neg_read_grad, dg, delta_read, delta_neg = ops._softdelta_gate_bwd_deltas(
+            y_grad, neg_read, g, y)
+        if delta_read is not None:
+            deltas = (delta_read, delta_neg)
+            restored_read = None
+    if deltas is None:
+        neg_read_grad, dg, restored_read = ops._softdelta_gate_bwd(
+            y_grad, neg_read, g, None if level else y)
     neg_read_grad = neg_read_grad.view(batch, length, kv_heads, groups * group_dim)
     read_grad = y_grad.view(batch, length, q_heads, groups * group_dim)
     if level:
@@ -555,13 +596,48 @@ def _backward(y_grad, q, k, v, g, k_read, prev_k, prev_v, q_segment_idx, k_segme
             None if x is None else x.to(q.dtype) for x in (dq, dk, dv, dk_read, dprev_k, dprev_v)
         )
     else:
-        read = ops._softdelta_gate_restore(y, neg_read, g).view(batch, length, q_heads, groups * group_dim)
+        # restored_read was already computed by the fused gate_bwd call above; gate_restore
+        # returns it unchanged (no kernel launch), keeping the gate_bwd-then-gate_restore call
+        # sequence that route traces, launch counts and tests see.
         neg_read = neg_read.reshape(batch, length, kv_heads, groups * group_dim).contiguous()
         read_lse, neg_read_lse = lse[:, kv_heads:].contiguous(), lse[:, :kv_heads].contiguous()
         # Grouped heads: the query reads' dK / dV stay in their FP32 accumulators, so each merged
         # gradient is rounded once.
         fp32_kv_grads = q_heads > kv_heads and not _matched_reset(q, q_segment_idx, k_segment_idx, local)
-        if local is not None:
+        pair = None
+        read = None
+        if deltas is not None:
+            # Both reads in one native call whose key leaf takes the read keys as one more reader
+            # of each KV head (dK / dV of both reads summed in the leaf, rounded once, no merge),
+            # from the deltas the gate backward gave: neither read is passed. None when that call
+            # is not eligible (nothing has run).
+            from . import _sca_native
+            pair = _sca_native.softdelta_pair_bwd(
+                read_grad, q, k, flat_v, None, read_lse, neg_read_grad, k_read, None,
+                neg_read_lse, local.span, scale, q_segment_idx, k_segment_idx, local.reset,
+                bos_mask=bos_mask, delta=deltas[0], s_delta=deltas[1],
+            )
+            if pair is None:
+                # Not eligible after all: the other routes need the read itself.
+                _, _, restored_read = ops._softdelta_gate_bwd(y_grad, gate_neg_read, g, y)
+        if pair is None:
+            # restored_read was already computed by the fused gate_bwd call; gate_restore
+            # returns it unchanged (no kernel launch), keeping the gate_bwd-then-gate_restore
+            # call sequence that route traces, launch counts and tests see.
+            read = ops._softdelta_gate_restore(y, gate_neg_read, g, restored_read).view(
+                batch, length, q_heads, groups * group_dim)
+        if pair is None and deltas is None and pair_route:
+            # Both reads in one native call (as above), from the restored read.
+            from . import _sca_native
+            pair = _sca_native.softdelta_pair_bwd(
+                read_grad, q, k, flat_v, read, read_lse, neg_read_grad, k_read, neg_read,
+                neg_read_lse, local.span, scale, q_segment_idx, k_segment_idx, local.reset,
+                bos_mask=bos_mask,
+            )
+        if pair is not None:
+            dq, dk, dv, dk_read = pair
+            dprev_k = dprev_v = None
+        elif local is not None:
             common = (local, scale, prev_k, flat_prev_v, q_segment_idx, k_segment_idx)
             dq, dk, dv, dprev_k, dprev_v = _local_reader(
                 q, k, flat_v, *common, False, deterministic, dy=read_grad, y=read, lse=read_lse,
@@ -579,13 +655,16 @@ def _backward(y_grad, q, k, v, g, k_read, prev_k, prev_v, q_segment_idx, k_segme
                 neg_read_grad, k_read, k, flat_v, neg_read, neg_read_lse, None,
                 *common, strict_past=True,
             )
-        dk, dv = ops._softdelta_merge_gradients(
-            dk.contiguous(), dk_neg.contiguous(), dk_read.contiguous() if fold_k_read else None,
-            dv.contiguous(), dv_neg.contiguous(),
-        )
+        if pair is None:
+            dk, dv = ops._softdelta_merge_gradients(
+                dk.contiguous(), dk_neg.contiguous(), dk_read.contiguous() if fold_k_read else None,
+                dv.contiguous(), dv_neg.contiguous(),
+            )
         if fold_k_read:
             dk_read = None
-        if dprev_k is not None and dprev_k_neg is not None:
+        if pair is not None:
+            pass
+        elif dprev_k is not None and dprev_k_neg is not None:
             dprev_k, dprev_v = ops._softdelta_merge_gradients(
                 dprev_k.contiguous(), dprev_k_neg.contiguous(), None,
                 dprev_v.contiguous(), dprev_v_neg.contiguous(),
@@ -874,7 +953,7 @@ def _call_bwd(function, kind, arguments):
     dq, dk, dv, dg, dk_read, dprev_k, dprev_v = _backward(
         y_grad.unsqueeze(3), q, k, v, g, k_read, prev_k, prev_v, q_segment_idx, k_segment_idx,
         _state_rows(y).unsqueeze(3), _state_rows(neg_read).unsqueeze(3), lse.contiguous(),
-        resolved_scale, deterministic, level, local,
+        resolved_scale, deterministic, level, local, bos_mask=arguments["bos_mask"],
     )
     grads = (dq, dk, dv.flatten(3), dg.reshape(g.shape[:3]), dk_read)
     if "prev_k" not in arguments:

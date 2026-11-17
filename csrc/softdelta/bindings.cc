@@ -15,12 +15,20 @@ void DefineSoftDeltaOps(py::module& m) {
        py::arg("read"), py::arg("neg_read"), py::arg("gate"), py::arg("output") = py::none())
       .def(
           "_softdelta_gate_restore", &SoftDeltaGateRestore,
-          "SoftDelta read from the gated output: y + sigmoid(gate) * neg_read",
-          py::arg("y"), py::arg("neg_read"), py::arg("gate"))
+          "SoftDelta read from the gated output: y + sigmoid(gate) * neg_read, or `precomputed` "
+          "unchanged with no launch",
+          py::arg("y"), py::arg("neg_read"), py::arg("gate"), py::arg("precomputed") = py::none())
       .def(
           "_softdelta_gate_bwd", &SoftDeltaGateBwd,
-          "SoftDelta GQA-broadcast gate BWD: (neg_read_grad, gate_grad)",
-          py::arg("dy"), py::arg("neg_read"), py::arg("gate"))
+          "SoftDelta GQA-broadcast gate BWD: (neg_read_grad, gate_grad, read); read is the "
+          "restored query read when `y` is given (fused with the restore), else empty",
+          py::arg("dy"), py::arg("neg_read"), py::arg("gate"), py::arg("y") = py::none())
+      .def(
+          "_softdelta_gate_bwd_deltas", &SoftDeltaGateBwdDeltas,
+          "SoftDelta gate BWD with both reads' backward deltas instead of the restored read: "
+          "(neg_read_grad, gate_grad, delta_read [B,H,L], delta_neg [B,Hkv,L]); four undefined "
+          "tensors when the layout is not one it takes (the caller restores the read instead)",
+          py::arg("dy"), py::arg("neg_read"), py::arg("gate"), py::arg("y"))
       .def(
           "_softdelta_merge_gradients", &SoftDeltaMergeGradients,
           "SoftDelta K/V gradient merge (in place into 16-bit read gradients)",

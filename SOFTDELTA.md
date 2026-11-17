@@ -48,13 +48,27 @@ reads' dK/dV and the folded read-key gradient, rounded once; the previous chunk'
 
 ## Gate and merge kernels on B300 (`csrc/softdelta/gate.cu`)
 
-Unchanged. They are per-element or per-row kernels with fixed reduction order (the backward accumulates a group's query
+`_softdelta_gate_bwd_deltas` (sd-bwd-7b, H10 r2) is the fused gate backward that, instead of storing the restored read,
+emits both reads' backward deltas (rowsum(dy * read) [B, H, L] and rowsum(neg_read_grad * neg_read) [B, Hkv, L]) in the
+native preprocessing's summation order, bit-equal to it at V = 64, 128 and 256 (one value group); other layouts return
+None and take the restore route. Its kernel is latency-bound, so it runs at most 40 registers (6 blocks of 256 threads
+per SM) and requests every row a lane reads into L2 before its head loop; neither changes an operation or its order.
+The other gate and merge kernels are per-element or per-row kernels with fixed reduction order (the backward accumulates a group's query
 heads in a loop and reduces the gate gradient's dot product with a fixed butterfly of `__shfl_xor_sync`); no atomics.
 Checked on B300: 760 gate cases (fwd, restore, bwd; FP16/BF16; 9 head mappings; V in 8..256 including unaligned widths;
 contiguous, readers-slice and FP32-state layouts; the training sizes) within one unit in the last place of FP64 (plus
 the FP32 arithmetic's own rounding where terms cancel), and 1154 merge cases bit-identical to the same FP32 sum in
 PyTorch; every op repeated 3 times bit-exactly; the combined SHA-256 of all outputs identical in 3 fresh processes on
 three GPUs.
+
+## Promotion note (sd-bwd-7b, H29 r2 + H23 r1 + H25)
+
+This tree composes three measured branch rounds onto kernel#3: H29 r2 (the (128,128) companion key
+leaf runs 128-query rounds, SS N128 scores, in `BackwardKvR128Kernel`, +5.67% at the gate, J370),
+H23 r1 (`SoftDeltaGateBwdDeltaKernel` at 6 blocks/SM with an L2 prefetch of its rows, +0.70%,
+J348) and H25 (the native segment-id scan replacing `bos_mask.cumsum`, +0.27%, J353). Each round's
+own bit-equality checks are unchanged by composing them: they touch disjoint code (the key leaf,
+the gate-deltas kernel, and the host-side segment-id op).
 
 ## xLLM's calls (main `d31a245`, read, not run)
 

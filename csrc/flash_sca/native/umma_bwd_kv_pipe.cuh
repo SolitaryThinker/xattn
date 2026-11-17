@@ -129,6 +129,8 @@
 #include "flash_sca/native/umma_bwd_dv_pipe.cuh"  // dvpipe::MbarArrive/PackBarrierSync
 #include "flash_sca/native/umma_bwd_dk_pipe.cuh"  // dkpipe::TmemStore16, Round, FirstRound, NextRound
 
+#include "flash_sca/native/kv_companion.h"
+
 namespace xattn::ops::flash_sca_native {
 namespace umma {
 namespace kvpipe {
@@ -437,11 +439,75 @@ __device__ __forceinline__ void PackBlockMasked(const float (&s)[pt::kBlock],
   }
 }
 
+// The round sequence with the companion reader: dkpipe::NextRound with p.group + kComp heads per
+// query tile (head p.group is the companion's read key of this KV head).
+template <bool kComp>
+__device__ __forceinline__ void NextR(const Params& p, int64_t b, int64_t kb, int64_t ke,
+                                      int64_t last, dkpipe::Round* c) {
+  if (++c->h < dkpipe::kHalves) return;
+  c->h = 0;
+  if (++c->gh < p.group + (kComp ? 1 : 0)) return;
+  c->gh = 0;
+  c->t = dvpipe::NextTile(p, b, kb, ke, c->t + 1, last, &c->m);
+}
+
+// pt::ColumnOf for the companion reader of KV head hk: the strict read's LSE, delta and row
+// bounds (its own bounds when given, else the plain chunk rule with the query's own key
+// dropped), the same segment plane (the read keys sit at the query positions).
+__device__ __forceinline__ pt::ColumnMeta CompanionColumnOf(const Params& p, const KvCompanion& cp,
+                                                            int64_t b, int64_t hk, int64_t i,
+                                                            bool segments, bool row_in_range) {
+  pt::ColumnMeta c;
+  if (!row_in_range) {
+    c.lo = 1;
+    c.hi = 0;
+    return c;
+  }
+  int64_t lo, hi;
+  if (cp.row_lo != nullptr) {
+    lo = cp.row_lo[b * p.q_length + i];
+    hi = cp.row_hi[b * p.q_length + i];
+  } else {
+    const int64_t position = i + p.total_length - p.q_length;
+    lo = (position / p.chunk - 1) * p.chunk;
+    hi = position - 1;
+  }
+  lo = lo < 0 ? 0 : lo;
+  hi = hi >= p.total_length ? p.total_length - 1 : hi;
+  if (lo > hi) {
+    c.lo = INT_MAX;
+    c.hi = -1;
+  } else {
+    c.lo = static_cast<int32_t>(lo);
+    c.hi = static_cast<int32_t>(hi);
+  }
+  const int64_t stat = (b * p.kv_heads + hk) * p.q_length + i;
+  const float lse = cp.lse != nullptr ? cp.lse[stat] : -INFINITY;
+  c.lse2 = isfinite(lse) ? lse * pt::kLog2e : INFINITY;
+  c.delta = cp.delta != nullptr ? cp.delta[stat] : 0.f;
+  c.segment = segments ? p.q_segment[b * p.q_length + i] : 0;
+  return c;
+}
+
+// The column of round c: the grouped head's (pt::ColumnOf) or the companion's.
+template <bool kComp>
+__device__ __forceinline__ pt::ColumnMeta RoundColumnOf(const KvPipeLaunch& L, int64_t b,
+                                                        int64_t hk, const dkpipe::Round& c,
+                                                        int64_t ic, bool seg) {
+  const Params& p = L.lp.params;
+  if (kComp && c.gh == p.group) {
+    return CompanionColumnOf(p, L.comp, b, hk, ic, seg, ic < p.q_length);
+  }
+  return pt::ColumnOf(p, b, hk * p.group + c.gh, ic, seg, ic < p.q_length);
+}
+
 // kFp32Keys: dK/dV/dPrevK/dPrevV in FP32 (Params::key_grads_fp32), a separate instantiation so
-// that the 16-bit one keeps its own store code.
-template <typename E, int kStages, bool kFp32Keys = false, int kDB = 128, int kDvB = 128>
+// that the 16-bit one keeps its own store code. kComp: the companion reader (kv_companion.h).
+template <typename E, int kStages, bool kFp32Keys = false, int kDB = 128, int kDvB = 128,
+          bool kComp = false>
 __global__ void __launch_bounds__((Plan<kStages, kDB, kDvB>::kThreads), 1) BackwardKvPipeKernel(
-    const __grid_constant__ UmmaLaunchParams lp) {
+    const __grid_constant__ KvPipeLaunch L) {
+  const UmmaLaunchParams& lp = L.lp;
   using Pl = Plan<kStages, kDB, kDvB>;
   using Br = Bars<kStages, Pl::kMetaSlots>;
   using ColumnTable = typename Pl::Table;
@@ -541,19 +607,23 @@ __global__ void __launch_bounds__((Plan<kStages, kDB, kDvB>::kThreads), 1) Backw
         unsigned char* const qs = smem + st * Pl::kStageBytes;
         unsigned char* const gs = qs + Pl::kQBytes;
         const uint32_t bl = bar0 + 8u * (Br::kLd + st);
-        const int hq = static_cast<int>(hk * p.group + c.gh);
+        // The companion's round reads the read key and its gradient of this KV head.
+        const bool cr = kComp && c.gh == p.group;
+        const CUtensorMap* const qmap = cr ? &L.comp.q : &lp.maps.q;
+        const CUtensorMap* const gmap = cr ? &L.comp.dy : &lp.maps.dy;
+        const int hq = cr ? static_cast<int>(hk) : static_cast<int>(hk * p.group + c.gh);
         const int i0 = static_cast<int>(c.t * kBwdQueryRows + c.h * kRoundQueries);
         MbarArriveExpectTx(bl, Pl::kStageBytes);
         for (int s = 0; s < Pl::kSlabsK; ++s) {
-          TmaLoad4D(qs + s * Pl::kRoundSlabBytes, &lp.maps.q, bl, s * 64, hq, i0,
+          TmaLoad4D(qs + s * Pl::kRoundSlabBytes, qmap, bl, s * 64, hq, i0,
                     static_cast<int>(b));
         }
         for (int s = 0; s < Pl::kSlabsV; ++s) {
-          TmaLoad4D(gs + s * Pl::kRoundSlabBytes, &lp.maps.dy, bl, s * 64, hq, i0,
+          TmaLoad4D(gs + s * Pl::kRoundSlabBytes, gmap, bl, s * 64, hq, i0,
                     static_cast<int>(b));
         }
         ++r;
-        dkpipe::NextRound(p, b, kb, ke, qt_last, &c);
+        NextR<kComp>(p, b, kb, ke, qt_last, &c);
       }
     }
     __syncwarp();
@@ -632,7 +702,7 @@ __global__ void __launch_bounds__((Plan<kStages, kDB, kDvB>::kThreads), 1) Backw
       }
       for (;;) {
         dkpipe::Round n = c;
-        dkpipe::NextRound(p, b, kb, ke, qt_last, &n);
+        NextR<kComp>(p, b, kb, ke, qt_last, &n);
         const bool more = n.t <= qt_last;
         if (is_a) {
           if (!more) break;
@@ -685,14 +755,14 @@ __global__ void __launch_bounds__((Plan<kStages, kDB, kDvB>::kThreads), 1) Backw
 #pragma unroll
           for (int k = 0; k < kPer; ++k) {
             const int64_t ic = c.t * kBwdQueryRows + c.h * kRoundQueries + lane + 32 * k;
-            cm[k] = pt::ColumnOf(p, b, hk * p.group + c.gh, ic, seg, ic < p.q_length);
+            cm[k] = RoundColumnOf<kComp>(L, b, hk, c, ic, seg);
           }
 #pragma unroll
           for (int k = 0; k < kPer; ++k) ColumnTable::Store(tb, slot, lane + 32 * k, cm[k]);
           dvpipe::MbarArrive(bar0 + 8u * (Br::kMetaFull + slot));
         }
         ++r;
-        dkpipe::NextRound(p, b, kb, ke, qt_last, &c);
+        NextR<kComp>(p, b, kb, ke, qt_last, &c);
       }
     }
     __syncwarp();
@@ -715,21 +785,22 @@ __global__ void __launch_bounds__((Plan<kStages, kDB, kDvB>::kThreads), 1) Backw
       dkpipe::FirstRound(p, b, kb, ke, qt_first, qt_last, &c);
       uint32_t total = c.t <= qt_last ? 1u : 0u;  // rounds of the tile (all groups)
       if (g == 1 && c.t <= qt_last) {
-        dkpipe::NextRound(p, b, kb, ke, qt_last, &c);
+        NextR<kComp>(p, b, kb, ke, qt_last, &c);
         r = 1;
       }
       pt::ColumnMeta cm;
       if (c.t <= qt_last && gtid < kRoundQueries) {
         const int64_t ic = c.t * kBwdQueryRows + c.h * kRoundQueries + gtid;
-        cm = pt::ColumnOf(p, b, hk * p.group + c.gh, ic, seg, ic < p.q_length);
+        cm = RoundColumnOf<kComp>(L, b, hk, c, ic, seg);
       }
       while (c.t <= qt_last) {
         dkpipe::Round n = c;
-        dkpipe::NextRound(p, b, kb, ke, qt_last, &n);
+        NextR<kComp>(p, b, kb, ke, qt_last, &n);
         dkpipe::Round n2 = n;  // this group's next round
-        if (n.t <= qt_last) dkpipe::NextRound(p, b, kb, ke, qt_last, &n2);
+        if (n.t <= qt_last) NextR<kComp>(p, b, kb, ke, qt_last, &n2);
         total = (n.t <= qt_last) ? r + 2 : r + 1;
-        const bool full = !seg && FullTile(c.m, kb, ke);
+        // The companion's rounds take the masked form (its strict diagonal is not in c.m).
+        const bool full = !seg && FullTile(c.m, kb, ke) && !(kComp && c.gh == p.group);
         const uint32_t buf = r & 1u;  // == g
         const uint32_t tslot = r % 4u;
         // Slot r % 4 was last read at round r - 4 by this group, before every one of its threads
@@ -738,7 +809,7 @@ __global__ void __launch_bounds__((Plan<kStages, kDB, kDvB>::kThreads), 1) Backw
         asm volatile("bar.sync %0, %1;" ::"r"(1 + g), "r"(kPackThreads / 2) : "memory");
         if (n2.t <= qt_last && gtid < kRoundQueries) {
           const int64_t ic = n2.t * kBwdQueryRows + n2.h * kRoundQueries + gtid;
-          cm = pt::ColumnOf(p, b, hk * p.group + n2.gh, ic, seg, ic < p.q_length);
+          cm = RoundColumnOf<kComp>(L, b, hk, n2, ic, seg);
         }
         MbarWait(bar0 + 8u * (Br::kS + buf), (r >> 1) & 1u);
         TmemFenceAfterSync();
@@ -788,14 +859,14 @@ __global__ void __launch_bounds__((Plan<kStages, kDB, kDvB>::kThreads), 1) Backw
     if constexpr (kMetaWarps == 0) {
       if (c.t <= qt_last && tid < kRoundQueries) {
         const int64_t ic = c.t * kBwdQueryRows + c.h * kRoundQueries + tid;
-        cm = pt::ColumnOf(p, b, hk * p.group + c.gh, ic, seg, ic < p.q_length);
+        cm = RoundColumnOf<kComp>(L, b, hk, c, ic, seg);
       }
     }
     while (c.t <= qt_last) {
       dkpipe::Round n = c;
-      dkpipe::NextRound(p, b, kb, ke, qt_last, &n);
+      NextR<kComp>(p, b, kb, ke, qt_last, &n);
       // FullTileExact(c.m, p, b, kb, ke), with its segment test (detail::SegmentTest) read once.
-      const bool full = !seg && FullTile(c.m, kb, ke);
+      const bool full = !seg && FullTile(c.m, kb, ke) && !(kComp && c.gh == p.group);
       const uint32_t buf = r & 1u;
       const uint32_t tslot = r % kMetaSlots;  // = buf on the staging path
       if constexpr (kMetaWarps > 0) {
@@ -809,7 +880,7 @@ __global__ void __launch_bounds__((Plan<kStages, kDB, kDvB>::kThreads), 1) Backw
       // Round r+1's gathers, one round ahead (consumed at the next round's staging).
       if (n.t <= qt_last && tid < kRoundQueries) {
         const int64_t ic = n.t * kBwdQueryRows + n.h * kRoundQueries + tid;
-        cm = pt::ColumnOf(p, b, hk * p.group + n.gh, ic, seg, ic < p.q_length);
+        cm = RoundColumnOf<kComp>(L, b, hk, n, ic, seg);
       }
       }
       MbarWait(bar0 + 8u * (Br::kS + buf), (r >> 1) & 1u);
@@ -951,12 +1022,53 @@ bool LaunchUmmaBackwardKvPipe(const UmmaLaunchParams& lp, cudaStream_t stream) {
       static_cast<unsigned>((p.total_length + kvpipe::kKeyRows - 1) / kvpipe::kKeyRows);
   if (gx == 0) return true;  // no work (see LaunchUmmaBackwardDkdv)
   const dim3 grid(gx, static_cast<unsigned>(p.kv_heads), static_cast<unsigned>(p.batch));
-  kernel<<<grid, Pl::kThreads, Pl::kSmemBytes, stream>>>(lp);
+  KvPipeLaunch launch{};
+  launch.lp = lp;
+  kernel<<<grid, Pl::kThreads, Pl::kSmemBytes, stream>>>(launch);
   const cudaError_t launched = cudaGetLastError();
   if (launched != cudaSuccess) {
     dkdv_detail::RaiseCuda("flash_sca native bwd kv pipe: kernel launch", launched);
   }
   kvpipe::KvPipeLaunchCount().fetch_add(1, std::memory_order_relaxed);
+  return true;
+}
+
+// The companion launch (kv_companion.h) at (128,128): the same preflight, 16-bit key gradients
+// (the grouped and strict reads' sum is rounded once here), grouped heads.
+template <typename E>
+bool CanLaunchUmmaBackwardKvPipeCompanionT(const UmmaLaunchParams& lp) {
+  const Params& p = lp.params;
+  if (p.key_grads_fp32 || p.group < 1 || p.strict) return false;
+  if (p.saved_fp32 || p.subtract_before_scale) return false;
+  return CanLaunchUmmaBackwardKvPipe<E>(lp);
+}
+
+template <typename E>
+bool LaunchUmmaBackwardKvPipeCompanionT(const UmmaLaunchParams& lp, const KvCompanion& comp,
+                                        cudaStream_t stream) {
+  using Pl = kvpipe::Plan<kvpipe::kRingStages>;
+  const Params& p = lp.params;
+  if (!CanLaunchUmmaBackwardKvPipeCompanionT<E>(lp)) return false;
+  const auto kernel = kvpipe::BackwardKvPipeKernel<E, kvpipe::kRingStages, false, 128, 128, true>;
+  const cudaError_t attr =
+      cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, Pl::kSmemBytes);
+  if (attr != cudaSuccess) {
+    dkdv_detail::RaiseCuda("flash_sca native bwd kv pipe companion: cudaFuncSetAttribute", attr);
+  }
+  const unsigned gx =
+      static_cast<unsigned>((p.total_length + kvpipe::kKeyRows - 1) / kvpipe::kKeyRows);
+  if (gx == 0) return true;
+  const dim3 grid(gx, static_cast<unsigned>(p.kv_heads), static_cast<unsigned>(p.batch));
+  KvPipeLaunch launch{};
+  launch.lp = lp;
+  launch.comp = comp;
+  kernel<<<grid, Pl::kThreads, Pl::kSmemBytes, stream>>>(launch);
+  const cudaError_t launched = cudaGetLastError();
+  if (launched != cudaSuccess) {
+    dkdv_detail::RaiseCuda("flash_sca native bwd kv pipe companion: kernel launch", launched);
+  }
+  kvpipe::KvPipeLaunchCount().fetch_add(1, std::memory_order_relaxed);
+  InSituLaunchedKeyRows() = kvpipe::kKeyRows;
   return true;
 }
 
@@ -1023,7 +1135,9 @@ bool LaunchUmmaBackwardKvPipeAt(const UmmaLaunchParams& lp, cudaStream_t stream)
       static_cast<unsigned>((p.total_length + kvpipe::kKeyRows - 1) / kvpipe::kKeyRows);
   if (gx == 0) return true;
   const dim3 grid(gx, static_cast<unsigned>(p.kv_heads), static_cast<unsigned>(p.batch));
-  kernel<<<grid, Pl::kThreads, Pl::kSmemBytes, stream>>>(lp);
+  KvPipeLaunch launch{};
+  launch.lp = lp;
+  kernel<<<grid, Pl::kThreads, Pl::kSmemBytes, stream>>>(launch);
   const cudaError_t launched = cudaGetLastError();
   if (launched != cudaSuccess) {
     dkdv_detail::RaiseCuda("flash_sca native bwd kv pipe: kernel launch", launched);

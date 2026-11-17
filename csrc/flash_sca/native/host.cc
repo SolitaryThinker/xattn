@@ -1324,6 +1324,144 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, OptionalTensor, OptionalTensor> B
   return {dq, dk, dv, dprev_k, dprev_v};
 }
 
+// One read of the SoftDelta pair backward, prepared as Backward() prepares a call (bounds, Params,
+// delta, outputs, tile tables, maps, phase plan) and not launched. `ok` is false when the read has
+// no native plan; nothing has run then.
+struct PairRead {
+  Prepared prepared;
+  at::Tensor mask_lo, mask_hi, dy_c, saved_c, lse_c, delta, dq, dk, dv, key_tile_range;
+  bwd_host::BackwardUmma umma;
+  BackwardPhases phases;
+  bool ok = false;
+};
+
+void PreparePairRead(PairRead& r, const at::Tensor& dy, const at::Tensor& q, const at::Tensor& k,
+                     const at::Tensor& v, const OptionalTensor& saved, const at::Tensor& lse,
+                     int64_t chunk_size, double scale, const OptionalTensor& q_segment,
+                     const OptionalTensor& k_segment, const OptionalTensor& segment_exact,
+                     const OptionalTensor& row_lo, const OptionalTensor& row_hi, bool strict,
+                     const OptionalTensor& bos_mask, const OptionalTensor& given_delta) {
+  OptionalTensor lo_arg = row_lo;
+  OptionalTensor hi_arg = row_hi;
+  if (bos_mask) {
+    TORCH_CHECK(!row_lo.has_value() && !row_hi.has_value(),
+                "native FlashSCA takes row bounds or a BOS mask, not both");
+    TORCH_CHECK(bos_mask->dim() == 2 && bos_mask->size(0) == q.size(0) &&
+                    bos_mask->size(1) >= q.size(1),
+                "native FlashSCA bos_mask must be [B, Nt] with Nt >= Nq");
+    std::tie(r.mask_lo, r.mask_hi) =
+        RowBoundsFromMask(*bos_mask, q.size(1), bos_mask->size(1), chunk_size, strict);
+    lo_arg = r.mask_lo;
+    hi_arg = r.mask_hi;
+  }
+  r.prepared = PrepareCommon(q, k, v, OptionalTensor(), OptionalTensor(), chunk_size, scale,
+                             q_segment, k_segment, segment_exact, lo_arg, hi_arg, strict);
+  Params& p = r.prepared.params;
+  CheckDevice(dy, q, "y_grad");
+  CheckDevice(lse, q, "lse");
+  const std::vector<int64_t> out_shape{p.batch, p.q_length, p.query_heads, p.value_dim};
+  const std::vector<int64_t> stat_shape{p.batch, p.query_heads, p.q_length};
+  TORCH_CHECK(dy.sizes() == out_shape && dy.scalar_type() == q.scalar_type(),
+              "native SoftDelta backward: y_grad must be [B,Nq,Hq,Dv] in Q's dtype");
+  // Exactly one of the saved output and a precomputed delta: with the delta (the SoftDelta gate
+  // backward's, in the preprocessing's summation order) the read itself is never needed, the
+  // preprocessing keeps only its tile tables, and no restored read is materialized.
+  TORCH_CHECK(saved.has_value() != given_delta.has_value(),
+              "native SoftDelta backward: give the saved output or the delta, exactly one");
+  if (saved) {
+    CheckDevice(*saved, q, "saved output");
+    TORCH_CHECK(saved->sizes() == out_shape && saved->scalar_type() == q.scalar_type(),
+                "native SoftDelta backward: saved output must be [B,Nq,Hq,Dv] in Q's dtype");
+  } else {
+    CheckDevice(*given_delta, q, "delta");
+    TORCH_CHECK(given_delta->scalar_type() == at::kFloat && given_delta->sizes() == stat_shape,
+                "native SoftDelta backward: delta must be FP32 [B,Hq,Nq]");
+  }
+  TORCH_CHECK(lse.scalar_type() == at::kFloat && lse.sizes() == stat_shape,
+              "native SoftDelta backward: lse must be FP32 [B,Hq,Nq]");
+  r.dy_c = PrepareContiguous(dy);
+  // Without a saved plane the prepared launch is described with dy in its place (same shape,
+  // dtype and alignment, which is all the preparation checks) and `saved` is cleared below:
+  // nothing reads it once delta is given.
+  r.saved_c = saved ? PrepareContiguous(*saved) : r.dy_c;
+  r.lse_c = lse.contiguous();
+  p.dy = r.dy_c.data_ptr();
+  p.saved = r.saved_c.data_ptr();
+  p.saved_fp32 = false;
+  p.lse_in = r.lse_c.data_ptr<float>();
+  if (given_delta) {
+    r.delta = PrepareContiguous(*given_delta);
+    TORCH_CHECK(reinterpret_cast<uintptr_t>(r.delta.data_ptr()) % 16 == 0,
+                "native SoftDelta backward: delta must be 16-byte aligned");
+  } else {
+    r.delta = at::empty(stat_shape, q.options().dtype(at::kFloat));
+  }
+  p.delta = r.delta.data_ptr<float>();
+  p.key_grads_fp32 = false;
+  r.dq = at::empty({p.batch, p.q_length, p.query_heads, p.qk_dim}, q.options());
+  r.dk = at::empty({p.batch, p.k_length, p.kv_heads, p.qk_dim}, q.options());
+  r.dv = at::empty({p.batch, p.k_length, p.kv_heads, p.value_dim}, q.options());
+  p.dq = r.dq.data_ptr();
+  p.dk = r.dk.data_ptr();
+  p.dv = r.dv.data_ptr();
+  if (p.batch == 0) return;
+  r.prepared.tile_bounds = at::empty({p.batch, p.tile_count, 4}, q.options().dtype(at::kInt));
+  p.tile_bounds = r.prepared.tile_bounds.data_ptr<int32_t>();
+  if (p.row_lo != nullptr) {
+    p.key_tile_count = (p.total_length + 63) / 64;
+    r.key_tile_range = at::empty({p.batch, p.key_tile_count, 2}, q.options().dtype(at::kInt));
+    p.key_tile_range = r.key_tile_range.data_ptr<int32_t>();
+  }
+  r.umma = bwd_host::PrepareBackwardUmma(r.prepared.q, r.prepared.k, r.prepared.v, nullptr,
+                                         nullptr, r.dy_c, r.saved_c, r.lse_c, r.delta, r.dq, r.dk,
+                                         r.dv, nullptr, nullptr, at::Tensor(), true, p);
+  if (!r.umma.ok()) return;
+  if (!saved) {
+    p.saved = nullptr;
+    r.umma.launch.params.saved = nullptr;
+  }
+  const char* reason = nullptr;
+  if (!PlanBackwardPhases(p, r.umma.launch, q.scalar_type(), true, &r.phases, &reason,
+                          BackwardArm::kOff)) {
+    return;
+  }
+  r.ok = true;
+}
+
+// The native SoftDelta pair backward: the grouped read (q, dy, y, lse; inclusive) and the strict
+// read (s_q = the read keys, s_dy, s_saved = the negative read, s_lse; strict past) over the same
+// K/V, with one key leaf for both (kv_companion.h). Returns [dq, dk, dv, dk_read] with dk/dv the
+// sum of both reads rounded once, or an empty list when the pair is not eligible, in which case
+// nothing has been launched and the caller runs the two reads and the merge.
+std::vector<at::Tensor> SoftDeltaPairBackward(
+    const at::Tensor& dy, const at::Tensor& q, const at::Tensor& k, const at::Tensor& v,
+    const OptionalTensor& saved, const at::Tensor& lse, const at::Tensor& s_dy,
+    const at::Tensor& s_q, const OptionalTensor& s_saved, const at::Tensor& s_lse,
+    int64_t chunk_size, double scale, const OptionalTensor& q_segment,
+    const OptionalTensor& k_segment, const OptionalTensor& segment_exact,
+    const OptionalTensor& row_lo, const OptionalTensor& row_hi, const OptionalTensor& s_row_lo,
+    const OptionalTensor& s_row_hi, const OptionalTensor& bos_mask, const OptionalTensor& delta,
+    const OptionalTensor& s_delta) {
+  c10::cuda::CUDAGuard guard(q.device());
+  PairRead g;
+  PreparePairRead(g, dy, q, k, v, saved, lse, chunk_size, scale, q_segment, k_segment,
+                  segment_exact, row_lo, row_hi, false, bos_mask, delta);
+  if (!g.ok) return {};
+  PairRead s;
+  PreparePairRead(s, s_dy, s_q, k, v, s_saved, s_lse, chunk_size, scale, q_segment, k_segment,
+                  segment_exact, s_row_lo, s_row_hi, true, bos_mask, s_delta);
+  if (!s.ok) return {};
+  if (!SoftDeltaPairEligible(g.prepared.params, g.umma.launch, g.phases, s.prepared.params,
+                             s.umma.launch, s.phases)) {
+    return {};
+  }
+  const cudaStream_t stream = at::cuda::getCurrentCUDAStream(q.get_device());
+  LaunchSoftDeltaBackwardPhases(g.prepared.params, g.umma.launch, g.phases, s.prepared.params,
+                                s.umma.launch, s.phases, stream);
+  g_backward_launches.fetch_add(1, std::memory_order_relaxed);
+  return {g.dq, g.dk, g.dv, s.dq};
+}
+
 std::tuple<at::Tensor, at::Tensor> RowBounds(const at::Tensor& ids, int64_t q_length,
                                              int64_t total, int64_t chunk_size, bool strict) {
   // The fused visible-bounds reduction of the metadata boundary (row_bounds.h). Its input is
@@ -1639,6 +1777,26 @@ std::vector<at::Tensor> RowBoundsFromBos(const at::Tensor& bos_mask, int64_t q_l
   return out;
 }
 
+// H25: segment ids of a packed-sequence BOS mask, one launch (row_bounds.cu). Called from
+// `xattn/ops/softdelta_attention.py` where `_prepare_segments` used to build them with
+// `bos_mask.cumsum(dim=1, dtype=torch.int64)`; the values are the same, bit for bit (an integer
+// prefix sum has one correct result).
+at::Tensor SegmentIdsFromBos(const at::Tensor& bos_mask) {
+  TORCH_CHECK(bos_mask.is_cuda(), "native FlashSCA segment ids require a CUDA bos_mask");
+  TORCH_CHECK(bos_mask.scalar_type() == at::kBool && bos_mask.dim() == 2,
+              "native FlashSCA segment ids need a bool [B, total] bos_mask");
+  TORCH_CHECK(bos_mask.is_contiguous(), "native FlashSCA segment ids need a contiguous bos_mask");
+  c10::cuda::CUDAGuard guard(bos_mask.device());
+  const int64_t batch = bos_mask.size(0);
+  const int64_t total = bos_mask.size(1);
+  at::Tensor out = at::empty({batch, total}, bos_mask.options().dtype(at::kLong));
+  if (batch == 0 || total == 0) return out;
+  const cudaStream_t stream = at::cuda::getCurrentCUDAStream(bos_mask.get_device());
+  LaunchSegmentIdsFromBos(reinterpret_cast<const unsigned char*>(bos_mask.data_ptr<bool>()),
+                          out.data_ptr<int64_t>(), batch, total, stream);
+  return out;
+}
+
 }  // namespace
 }  // namespace flash_sca_native
 
@@ -1752,6 +1910,10 @@ void DefineNativeFlashSCAOps(py::module& m) {
            "launch; the same values the torch reduction produced",
            py::arg("bos_mask"), py::arg("q_length"), py::arg("total"), py::arg("chunk_size"),
            py::arg("strict_past"), py::arg("reset"))
+      .def("_flash_sca_segment_ids_from_bos", &SegmentIdsFromBos,
+           "Segment ids (int64 [B, total]) of a packed-sequence BOS mask, one launch; the same "
+           "values bos_mask.cumsum(dim=1, dtype=torch.int64) produces",
+           py::arg("bos_mask"))
       .def("_flash_sca_native_fwd", &Forward, "Native Blackwell FlashSCA forward",
            py::arg("q"), py::arg("k"), py::arg("v"), py::arg("prev_k"), py::arg("prev_v"),
            py::arg("chunk_size"), py::arg("scale"), py::arg("q_segment_idx"),
@@ -1795,6 +1957,18 @@ void DefineNativeFlashSCAOps(py::module& m) {
            "visible key (zero output, zero gradient)",
            py::arg("ids"), py::arg("q_length"), py::arg("total"), py::arg("chunk_size"),
            py::arg("strict_past"))
+      .def("_flash_sca_native_softdelta_pair_bwd", &SoftDeltaPairBackward,
+           "Native SoftDelta backward of both reads over the same K/V, the strict read as one "
+           "more reader of the grouped read's key leaf: [dq, dk, dv, dk_read] (dk/dv the sum of "
+           "both reads, rounded once), or [] when the pair is not eligible (nothing launched)",
+           py::arg("y_grad"), py::arg("q"), py::arg("k"), py::arg("v"),
+           py::arg("saved_output"), py::arg("lse"), py::arg("strict_y_grad"),
+           py::arg("strict_q"), py::arg("strict_saved_output"), py::arg("strict_lse"),
+           py::arg("chunk_size"), py::arg("scale"), py::arg("q_segment_idx"),
+           py::arg("k_segment_idx"), py::arg("segment_exact"), py::arg("row_lo"),
+           py::arg("row_hi"), py::arg("strict_row_lo"), py::arg("strict_row_hi"),
+           py::arg("bos_mask") = py::none(), py::arg("delta") = py::none(),
+           py::arg("strict_delta") = py::none())
       .def("_flash_sca_native_bwd", &Backward,
            "Native Blackwell FlashSCA backward; fp32_kv_grads (grouped query heads) returns "
            "dk/dv/dprev_k/dprev_v in FP32, the values the 16-bit outputs are rounded from",

@@ -1203,6 +1203,655 @@ const uint32_t dst =
 #undef XATTN_DQP_BAR
 }
 
+// ------------------------------------------------------------------ the flat persistent form
+// DqFlatKernel: the same leaf, the same tiles, the same MMAs per tile in the same order with the
+// same operands (dQ bit-equal), at the maps with Q / dO resident in TMEM from TMA landing tiles,
+// two pack groups and a dQ issuer warp (Plan::kTmemA && kCp && kPingPong && kDqIssuer: (128,128)
+// and (128,64)). What changes is that consecutive tiles of a CTA overlap instead of running one
+// after the other: DqPipeKernel re-initializes its barriers, recomputes the tile's row bounds
+// behind two CTA barriers, loads Q / dO and fills the K / V rings only after the previous tile's
+// epilogue, so each tile pays a fill and a drain (several microseconds against ~0.4 us per key
+// step), which is most of a tile at short-document masks. Here:
+//   - barriers are initialized once; every ring (K, V, S / dP buffers, pack, dQ) counts GLOBAL
+//     key steps g over the CTA's live tiles, so their phases run on across tiles;
+//   - warp 11 (the scheduler) claims tiles from the counter and computes each tile's bounds
+//     (min lo, max hi, max lo, min hi over its 128 rows: DqPipeKernel's reductions) into a
+//     two-slot ring of descriptors, one tile ahead, claimed once the S / dP issuer is within
+//     FlatPlan::kLook steps of the current tile's end;
+//   - the producer issues Q / dO of tile T + 1 as soon as the copies of tile T into TMEM are done
+//     (kQFree) and runs its K / V streams on into tile T + 1 while tile T drains;
+//   - the S / dP issuer copies tile T + 1's Q / dO into TMEM once every S / dP of tile T has
+//     completed, then issues S / dP(T + 1, 0..1) under the pack of tile T's last steps;
+//   - dQ(T + 1, 0) (the accumulator reset) waits only for the epilogue of tile T to have read
+//     the dQ columns (kDqDrained).
+// The pack warps read the row constants of tile T + 1 (lse, delta, bounds) while they wait for
+// dQ(T) to complete.
+template <int kD, int kDv>
+struct FlatPlan {
+  using Pl = Plan<kD, kDv>;
+  static constexpr bool kEligible = Pl::kTmemA && Pl::kCp && Pl::kPingPong && Pl::kDqIssuer;
+  static constexpr int kSchedWarp = Pl::kThreads / 32;            // 11
+  static constexpr int kThreads = Pl::kThreads + 32;              // 384
+  // Extra barriers and the descriptor ring live after the plan's tail, inside its rounding.
+  static constexpr int kXBarOff = ((Pl::kEnd + 7) / 8) * 8;
+  static constexpr int kBarQFree = 0, kBarDrained = 1, kBarDescFull = 2, kBarDescEmpty = 4,
+                       kBarFinal = 6, kXBarCount = 8;
+  static constexpr int kDescOff = kXBarOff + 8 * kXBarCount;      // 2 x 32 B
+  static constexpr int kProgOff = kDescOff + 64;                 // u32: S/dP steps issued
+  static constexpr int kEnd = kProgOff + 8;
+  // The scheduler claims tile it + 1 once the issuer is within kLook steps of tile it's end:
+  // early enough to hide the claim and the bounds reduction, late enough that a claimed tile
+  // does not wait behind a long one while other SMs run dry at the grid's tail.
+  static constexpr uint32_t kLook = 4;
+  static constexpr int kDescEmptyCount = 3 + kPackWarps;         // producer, 2 issuers, 8 pack warps
+  static_assert(!kEligible || ((kEnd + 1023) / 1024) * 1024 + 1024 <= Pl::kSmemBytes,
+                "the flat plan's extra barriers and descriptors fit the plan's SMEM image");
+};
+
+struct FlatDesc {
+  int32_t tile, t0, steps, min_lo, max_hi, max_lo, min_hi, pad;
+};
+
+template <class Elem, int kD, int kDv>
+__global__ void __launch_bounds__(FlatPlan<kD, kDv>::kThreads, 1) DqFlatKernel(
+    const __grid_constant__ UmmaLaunchParams lp, unsigned int* const tile_counter,
+    const int total_tiles) {
+  using Pl = Plan<kD, kDv>;
+  using Fp = FlatPlan<kD, kDv>;
+  static_assert(Fp::kEligible, "the flat form serves the resident-Q/dO ping-pong maps only");
+  const Params& p = lp.params;
+  extern __shared__ __align__(1024) unsigned char smem_raw[];
+  unsigned char* const smem = smem_raw + ((1024u - (SmemAddr(smem_raw) & 1023u)) & 1023u);
+  unsigned char* const sq = smem + Pl::kQOff;
+  unsigned char* const sdy = smem + Pl::kDyOff;
+  unsigned char* const sk = smem + Pl::kKOff;
+  unsigned char* const sv = smem + Pl::kVOff;
+  const uint32_t bar0 = SmemAddr(smem + Pl::kBarOff);
+  const uint32_t xbar0 = SmemAddr(smem + Fp::kXBarOff);
+  FlatDesc* const descs = reinterpret_cast<FlatDesc*>(smem + Fp::kDescOff);
+  volatile uint32_t* const sdp_issued = reinterpret_cast<volatile uint32_t*>(smem + Fp::kProgOff);
+  uint32_t* const tmem_slot = reinterpret_cast<uint32_t*>(smem + Pl::kSlotOff);
+  int64_t* const kseg = reinterpret_cast<int64_t*>(smem + Pl::kSegOff);
+#define XATTN_DQF_BAR(slot) (bar0 + 8u * static_cast<uint32_t>(slot))
+#define XATTN_DQF_XBAR(slot) (xbar0 + 8u * static_cast<uint32_t>(slot))
+  constexpr int kKS = Pl::kKStages, kVS = Pl::kVStages;
+  constexpr int kBarQ = Pl::kBarQ, kBarDy = Pl::kBarDy, kBarK = Pl::kBarK, kBarV = Pl::kBarV;
+  constexpr int kBarVfree = Pl::kBarVfree, kBarS = Pl::kBarS, kBarDq = Pl::kBarDq;
+  constexpr int kBarPack = Pl::kBarPack, kBarKfree = Pl::kBarKfree, kBarCount = Pl::kBarCount;
+
+  const int tid = threadIdx.x;
+  const int warp = tid >> 5;
+  const int lane = tid & 31;
+  const int w4 = warp & 3;
+  const int ch = (warp >> 2) & 1;
+  const int row = 32 * w4 + lane;
+  const int nqt = (p.q_length + kBM - 1) / kBM;
+  const int64_t nhq = p.query_heads;
+  const int64_t tiles_per_batch = static_cast<int64_t>(nqt) * nhq;
+
+  if (warp == 0) {
+    TmemAlloc(Pl::kAllocCols, tmem_slot);
+    TmemRelinquish();
+  }
+  if (tid == 0) {
+    for (int s = 0; s < kBarCount; ++s) {
+      MbarInit(XATTN_DQF_BAR(s),
+               (s == kBarPack || s == kBarPack + 1) ? Pl::kPackArrivals : 1);
+    }
+    for (int s = 0; s < Fp::kXBarCount; ++s) {
+      int count = 1;
+      if (s == Fp::kBarDrained) count = kPackThreads;
+      if (s == Fp::kBarDescEmpty || s == Fp::kBarDescEmpty + 1) count = Fp::kDescEmptyCount;
+      MbarInit(XATTN_DQF_XBAR(s), count);
+    }
+    MbarInitFence();
+    *sdp_issued = 0u;
+  }
+  TmemFenceBeforeSync();
+  __syncthreads();
+  TmemFenceAfterSync();
+  const uint32_t tbase = *tmem_slot & 0x1FFu;
+
+  // Every role but the scheduler walks the descriptor ring the same way.
+  auto read_desc = [&](int it, FlatDesc* d) {
+    const int slot = it & 1;
+    MbarWait(XATTN_DQF_XBAR(Fp::kBarDescFull + slot), static_cast<uint32_t>((it >> 1) & 1));
+    *d = descs[slot];
+  };
+  // One arrival per consuming warp (its lane 0; the producer runs on lane 0 only).
+  auto release_desc = [&](int it) {
+    __syncwarp(__activemask());
+    if (lane == 0) MbarArrive(XATTN_DQF_XBAR(Fp::kBarDescEmpty + (it & 1)));
+  };
+  auto decode = [&](int tile, int* qt, int64_t* hq, int64_t* b) {
+    *qt = tile % nqt;
+    *hq = (tile / nqt) % nhq;
+    *b = tile / tiles_per_batch;
+  };
+
+  if (warp == Fp::kSchedWarp) {
+    // ------------------------------------------------------------- scheduler
+    uint32_t g_end = 0;  // S/dP steps through the last tile described
+    for (int it = 0;; ++it) {
+      const int slot = it & 1;
+      if (it >= 2) {
+        MbarWait(XATTN_DQF_XBAR(Fp::kBarDescEmpty + slot), static_cast<uint32_t>(((it - 2) >> 1) & 1));
+      }
+      if (it >= 1 && g_end > Fp::kLook) {
+        // A scheduling hint only: which tile an SM takes changes no tile's bits.
+        while (*sdp_issued + Fp::kLook < g_end) __nanosleep(64);
+      }
+      int tile = 0;
+      if (lane == 0) tile = static_cast<int>(atomicAdd(tile_counter, 1u));
+      tile = __shfl_sync(0xFFFFFFFFu, tile, 0);
+      FlatDesc d{};
+      d.tile = tile < total_tiles ? tile : -1;
+      if (tile < total_tiles) {
+        int qt;
+        int64_t hq, b;
+        decode(tile, &qt, &hq, &b);
+        int lo = INT_MAX, hi = -1, mlo = INT_MIN, mhi = INT_MAX;
+        bool any_dead = false;
+        for (int k = 0; k < 4; ++k) {
+          const int64_t i = static_cast<int64_t>(qt) * kBM + 32 * k + lane;
+          const bool in = i < p.q_length;
+          const detail::Bounds bd = in ? detail::RowBounds(p, b, i) : detail::Bounds{INT_MAX, -1};
+          const bool live = in && bd.lo <= bd.hi;
+          lo = min(lo, live ? bd.lo : INT_MAX);
+          hi = max(hi, live ? bd.hi : -1);
+          // DqPipeKernel's max lo / min hi: a dead or absent row counts as INT_MAX / INT_MIN.
+          mlo = max(mlo, live ? bd.lo : INT_MAX);
+          mhi = min(mhi, live ? bd.hi : INT_MIN);
+          any_dead |= !live;
+        }
+        (void)any_dead;
+        d.min_lo = WarpMin(lo);
+        d.max_hi = WarpMax(hi);
+        d.max_lo = WarpMax(mlo);
+        d.min_hi = WarpMin(mhi);
+        if (d.min_lo > d.max_hi) {
+          d.steps = 0;
+          d.t0 = 0;
+        } else {
+          d.t0 = d.min_lo / kBN;
+          d.steps = d.max_hi / kBN - d.t0 + 1;
+        }
+      }
+      if (d.tile >= 0) g_end += static_cast<uint32_t>(d.steps);
+      if (lane == 0) descs[slot] = d;
+      __syncwarp();
+      if (lane == 0) MbarArrive(XATTN_DQF_XBAR(Fp::kBarDescFull + slot));
+      if (d.tile < 0) break;
+    }
+  } else if (warp == kProducerWarp) {
+    // ------------------------------------------------------------- TMA producer
+    if (lane == 0) {
+      uint32_t gk = 0, gv = 0;
+      int live_i = 0;
+      for (int it = 0;; ++it) {
+        FlatDesc d;
+        read_desc(it, &d);
+        release_desc(it);
+        if (d.tile < 0) break;
+        if (d.steps == 0) continue;
+        int qt;
+        int64_t hq, b;
+        decode(d.tile, &qt, &hq, &b);
+        const int64_t kvh = p.group > 0 ? hq / p.group : hq;
+        // The landing tiles are free once the previous live tile's copies into TMEM are done.
+        if (live_i >= 1) MbarWait(XATTN_DQF_XBAR(Fp::kBarQFree), static_cast<uint32_t>((live_i - 1) & 1));
+        MbarArriveExpectTx(XATTN_DQF_BAR(kBarQ), Pl::kQBytes);
+        for (int s = 0; s < Pl::kSlabsQ; ++s) {
+          for (int r = 0; r < kBM; r += kTmaRows) {
+            TmaLoad4D(sq + s * Pl::kSlab + r * 128, &lp.maps.q, XATTN_DQF_BAR(kBarQ), s * 64,
+                      static_cast<int>(hq), qt * kBM + r, static_cast<int>(b));
+          }
+        }
+        MbarArriveExpectTx(XATTN_DQF_BAR(kBarDy), Pl::kDyBytes);
+        for (int s = 0; s < Pl::kSlabsV; ++s) {
+          for (int r = 0; r < kBM; r += kTmaRows) {
+            TmaLoad4D(sdy + s * Pl::kSlab + r * 128, &lp.maps.dy, XATTN_DQF_BAR(kBarDy), s * 64,
+                      static_cast<int>(hq), qt * kBM + r, static_cast<int>(b));
+          }
+        }
+        int nk = 0, nv = 0;
+        uint32_t idle = 0;
+        while (nk < d.steps || nv < d.steps) {
+          bool moved = false;
+          const uint32_t g = gk + nk;
+          if (nk < d.steps &&
+              (g < static_cast<uint32_t>(kKS) ||
+               MbarTestWait(XATTN_DQF_BAR(kBarKfree + g % kKS), ((g - kKS) / kKS) & 1u))) {
+            const int64_t j0 = static_cast<int64_t>(d.t0 + nk) * kBN;
+            const CUtensorMap* kmap;
+            const CUtensorMap* vmap;
+            int row0;
+            ResolveKeyMap(lp, j0, &kmap, &vmap, &row0);
+            const uint32_t bk = XATTN_DQF_BAR(kBarK + g % kKS);
+            MbarArriveExpectTx(bk, Pl::kKStageBytes);
+            unsigned char* const kdst = sk + (g % kKS) * Pl::kKStageBytes;
+            for (int s = 0; s < Pl::kSlabsK; ++s) {
+              for (int r = 0; r < kBN; r += kTmaRows) {
+                TmaLoad4D(kdst + s * Pl::kKvSlab + r * 128, kmap, bk, s * 64,
+                          static_cast<int>(kvh), row0 + r, static_cast<int>(b));
+              }
+            }
+            ++nk;
+            moved = true;
+          }
+          const uint32_t gvv = gv + nv;
+          if (nv < d.steps &&
+              (gvv < static_cast<uint32_t>(kVS) ||
+               MbarTestWait(XATTN_DQF_BAR(kBarVfree + gvv % kVS), ((gvv - kVS) / kVS) & 1u))) {
+            const int64_t j0 = static_cast<int64_t>(d.t0 + nv) * kBN;
+            const CUtensorMap* kmap;
+            const CUtensorMap* vmap;
+            int row0;
+            ResolveKeyMap(lp, j0, &kmap, &vmap, &row0);
+            const uint32_t bv = XATTN_DQF_BAR(kBarV + gvv % kVS);
+            unsigned char* const vdst = sv + (gvv % kVS) * Pl::kVStageBytes;
+            MbarArriveExpectTx(bv, Pl::kVBytes);
+            for (int s = 0; s < Pl::kSlabsV; ++s) {
+              for (int r = 0; r < kBN; r += kTmaRows) {
+                TmaLoad4D(vdst + s * Pl::kKvSlab + r * 128, vmap, bv, s * 64,
+                          static_cast<int>(kvh), row0 + r, static_cast<int>(b));
+              }
+            }
+            ++nv;
+            moved = true;
+          }
+          if (moved) {
+            idle = 0;
+          } else {
+            if (++idle > (1u << 22)) __trap();
+            __nanosleep(20);
+          }
+        }
+        gk += d.steps;
+        gv += d.steps;
+        ++live_i;
+      }
+    }
+    __syncwarp();
+  } else if (warp == kMmaWarp || warp == kMmaWarp + 1) {
+    const bool dq_role = warp == kMmaWarp + 1;
+    const int elem_fmt = ElemTraits<Elem>::kFormat;
+    const uint32_t ss_idesc = MakeInstrDesc(elem_fmt, kBM, kBN, 0, 0);
+    const uint32_t dq_lbo = Pl::kSlabsK > 1 ? static_cast<uint32_t>(kBN * 8) : 0u;
+    const uint32_t dq_idesc = MakeInstrDesc(elem_fmt, kBM, kD <= 256 ? kD : 256, 0, 1);
+    const uint32_t qb_smem = SmemAddr(sq);
+    const uint32_t dyb_smem = SmemAddr(sdy);
+    const uint32_t k0_smem = SmemAddr(sk);
+    const uint32_t v0_smem = SmemAddr(sv);
+    // DqPipeKernel's issue bodies at the resident-Q/dO map, indexed by the GLOBAL step g.
+    auto issue_s = [&](uint32_t g) {
+      const uint32_t kb_smem = k0_smem + (g % kKS) * Pl::kKStageBytes;
+      const uint32_t dst = tbase + Pl::kSCol + (g & 1u) * Pl::kBufCols;
+      for (int kk = 0; kk < kD / 16; ++kk) {
+        const int slab = kk >> 2, within = kk & 3;
+        MmaTs(dst, tbase + static_cast<uint32_t>(Pl::kQCol + 8 * kk),
+              MakeSmemDesc(kb_smem + slab * Pl::kKvSlab + within * 32), ss_idesc,
+              kk == 0 ? 0u : 1u);
+      }
+    };
+    auto issue_dp = [&](uint32_t g) {
+      const uint32_t dst = tbase + Pl::kDpCol + (g & 1u) * Pl::kBufCols;
+      const uint32_t vb_smem = v0_smem + (g % kVS) * Pl::kVStageBytes;
+      for (int sl = 0; sl < Pl::kSlabsV; ++sl) {
+        for (int kk = 0; kk < 4; ++kk) {
+          MmaTs(dst, tbase + static_cast<uint32_t>(Pl::kDoCol + 8 * (4 * sl + kk)),
+                MakeSmemDesc(vb_smem + sl * Pl::kKvSlab + kk * 32), ss_idesc,
+                (sl == 0 && kk == 0) ? 0u : 1u);
+        }
+      }
+    };
+    auto issue_dq = [&](uint32_t g, bool first) {
+      const uint32_t kb_smem = k0_smem + (g % kKS) * Pl::kKStageBytes;
+      for (int kk = 0; kk < kBN / 16; ++kk) {
+        MmaTs(tbase + Pl::kDqCol, tbase + DsColumn(Pl::kSCol, g & 1u, kk),
+              MakeSmemDesc(kb_smem + kk * 16 * 128, dq_lbo, 64), dq_idesc,
+              (first && kk == 0) ? 0u : 1u);
+      }
+    };
+    auto wait_v = [&](uint32_t g) {
+      MbarWait(XATTN_DQF_BAR(kBarV + g % kVS), (g / kVS) & 1u);
+    };
+    auto wait_k = [&](uint32_t g) {
+      MbarWait(XATTN_DQF_BAR(kBarK + g % kKS), (g / kKS) & 1u);
+    };
+    uint32_t G = 0;
+    int live_i = 0;
+    if (dq_role) {
+      for (int it = 0;; ++it) {
+        FlatDesc d;
+        read_desc(it, &d);
+        release_desc(it);
+        if (d.tile < 0) break;
+        if (d.steps == 0) continue;
+        for (int n = 0; n < d.steps; ++n) {
+          const uint32_t g = G + n;
+          MbarWait(XATTN_DQF_BAR(kBarPack + (g & 1u)), (g >> 1) & 1u);
+          if (n == 0 && live_i >= 1) {
+            // The accumulator's previous tile has been read out by the epilogue.
+            MbarWait(XATTN_DQF_XBAR(Fp::kBarDrained), static_cast<uint32_t>((live_i - 1) & 1));
+          }
+          TmemFenceAfterSync();
+          __syncwarp();
+          issue_dq(g, n == 0);
+          MmaCommit(XATTN_DQF_BAR(kBarDq + (g & 1u)));
+          MmaCommit(XATTN_DQF_BAR(kBarKfree + g % kKS));
+        }
+        G += d.steps;
+        ++live_i;
+      }
+    } else {
+      int64_t last_s = -1;  // global step of the last S / dP issued
+      for (int it = 0;; ++it) {
+        FlatDesc d;
+        read_desc(it, &d);
+        release_desc(it);
+        if (d.tile < 0) break;
+        if (d.steps == 0) continue;
+        // Q / dO columns are read by every S / dP of the previous tile: all complete.
+        if (last_s >= 0) {
+          MbarWait(XATTN_DQF_BAR(kBarS + (last_s & 1)), static_cast<uint32_t>((last_s >> 1) & 1));
+        }
+        MbarWait(XATTN_DQF_BAR(kBarQ), static_cast<uint32_t>(live_i & 1));
+        MbarWait(XATTN_DQF_BAR(kBarDy), static_cast<uint32_t>(live_i & 1));
+        TmemFenceAfterSync();
+        __syncwarp();
+        for (int kk = 0; kk < kD / 16; ++kk) {
+          TmemCopy128x256b(tbase + static_cast<uint32_t>(Pl::kQCol + 8 * kk),
+                           MakeSmemDesc(qb_smem + (kk >> 2) * Pl::kSlab + (kk & 3) * 32));
+        }
+        for (int kk = 0; kk < kDv / 16; ++kk) {
+          TmemCopy128x256b(tbase + static_cast<uint32_t>(Pl::kDoCol + 8 * kk),
+                           MakeSmemDesc(dyb_smem + (kk >> 2) * Pl::kSlab + (kk & 3) * 32));
+        }
+        MmaCommit(XATTN_DQF_XBAR(Fp::kBarQFree));
+        // S / dP(g) for the tile's steps; the buffers' previous readers are pack(g - 2) (dP)
+        // and dQ(g - 2) (S, where dS(g - 2) lives), in this tile or the previous one.
+        auto issue_sdp = [&](uint32_t g) {
+          if (g >= 2) {
+            MbarWait(XATTN_DQF_BAR(kBarPack + (g & 1u)), ((g - 2) >> 1) & 1u);
+            TmemFenceAfterSync();
+          }
+          wait_v(g);
+          __syncwarp();
+          issue_dp(g);
+          MmaCommit(XATTN_DQF_BAR(kBarVfree + g % kVS));
+          wait_k(g);
+          if (g >= 2) MbarWait(XATTN_DQF_BAR(kBarDq + (g & 1u)), ((g - 2) >> 1) & 1u);
+          TmemFenceAfterSync();
+          __syncwarp();
+          issue_s(g);
+          MmaCommit(XATTN_DQF_BAR(kBarS + (g & 1u)));
+        };
+        for (int n = 0; n < d.steps; ++n) {
+          issue_sdp(G + n);
+          if (lane == 0) *sdp_issued = G + n + 1;
+        }
+        last_s = static_cast<int64_t>(G) + d.steps - 1;
+        G += d.steps;
+        ++live_i;
+      }
+    }
+    // Every commit of this warp has arrived before the CTA can exit.
+    MmaCommit(XATTN_DQF_XBAR(Fp::kBarFinal + (dq_role ? 1 : 0)));
+    MbarWait(XATTN_DQF_XBAR(Fp::kBarFinal + (dq_role ? 1 : 0)), 0u);
+  } else {
+    // ------------------------------------------------------------- pack warps 0..7
+    const uint32_t lane_base = static_cast<uint32_t>(32 * w4) << 16;
+    const int grp = warp >> 2;
+    int64_t* const kseg_g = kseg + grp * kBN;
+    const float sl2 = p.scale_log2;
+    const void* const saved_base =
+        p.saved != nullptr ? p.saved
+                           : (p.saved_fp32 ? static_cast<const void*>(p.y_state)
+                                           : static_cast<const void*>(p.y));
+    // The row constants of one tile (DqPipeKernel's expressions).
+    struct RowC {
+      int64_t b, hq, i;
+      bool in, lse_ok, seg;
+      detail::Bounds bd;
+      float lse_log2, delta;
+      int64_t qseg;
+    };
+    auto row_consts = [&](const FlatDesc& d) {
+      RowC r;
+      int qt;
+      decode(d.tile, &qt, &r.hq, &r.b);
+      r.i = static_cast<int64_t>(qt) * kBM + row;
+      r.in = r.i < p.q_length;
+      // The row's loads are issued independently of each other (the values they feed are the
+      // same as DqPipeKernel's chained form: lse and delta are only used where the row is live
+      // and its lse finite), so their latencies overlap instead of adding up.
+      const int64_t stat = (r.b * p.query_heads + r.hq) * p.q_length + r.i;
+      const float lse_raw = (r.in && p.lse_in != nullptr) ? p.lse_in[stat] : -INFINITY;
+      const float delta_raw = (r.in && p.delta != nullptr) ? p.delta[stat] : 0.f;
+      r.seg = detail::SegmentTest(p, r.b);
+      r.qseg = (r.seg && r.in) ? p.q_segment[r.b * p.q_length + r.i] : 0;
+      r.bd = r.in ? detail::RowBounds(p, r.b, r.i) : detail::Bounds{INT_MAX, -1};
+      const bool live = r.in && r.bd.lo <= r.bd.hi;
+      const float lse_i = live ? lse_raw : -INFINITY;
+      r.lse_ok = live && lse_i > -INFINITY && lse_i < INFINITY;
+      r.lse_log2 = r.lse_ok ? lse_i * kDqLog2e : INFINITY;
+      r.delta = 0.f;
+      if (r.lse_ok && p.delta != nullptr) {
+        r.delta = delta_raw;
+      } else if (r.lse_ok) {
+        const int64_t row0 = ((r.b * p.q_length + r.i) * p.query_heads + r.hq) * p.value_dim;
+        const Elem* const dy_row = reinterpret_cast<const Elem*>(p.dy) + row0;
+        float acc = 0.f;
+        if (p.saved_fp32) {
+          const float* const y_row = static_cast<const float*>(saved_base) + row0;
+          for (int64_t c = 0; c < p.value_dim; ++c) acc += ToFloat(dy_row[c]) * y_row[c];
+        } else {
+          const Elem* const y_row = static_cast<const Elem*>(saved_base) + row0;
+          for (int64_t c = 0; c < p.value_dim; ++c) acc += ToFloat(dy_row[c]) * ToFloat(y_row[c]);
+        }
+        r.delta = acc;
+      }
+      return r;
+    };
+    uint32_t G = 0;
+    int live_i = 0;
+    const int64_t nt_total = p.total_length;
+    // The pack warps release a descriptor slot only when its tile is done (below, and on the dead
+    // path), so the scheduler claims at most one tile ahead of the tile being packed: claiming
+    // further ahead would lengthen the grid's tail on uniform heavy masks. The next tile's
+    // descriptor and row constants are read during the current tile (`prefetch`), so their
+    // global-load latency is off the path between two tiles.
+    FlatDesc d;
+    read_desc(0, &d);
+    RowC rc{};
+    if (d.tile >= 0) rc = row_consts(d);
+    for (int it = 0;; ++it) {
+      if (d.tile < 0) break;
+      FlatDesc dn{};
+      RowC rcn{};
+      bool pre = false;
+      auto prefetch = [&](bool block) {
+        if (pre) return;
+        const int nslot = (it + 1) & 1;
+        const uint32_t nbar = XATTN_DQF_XBAR(Fp::kBarDescFull + nslot);
+        const uint32_t nph = static_cast<uint32_t>(((it + 1) >> 1) & 1);
+        const bool ready = __all_sync(0xFFFFFFFFu, MbarTestWait(nbar, nph));
+        if (!ready && !block) return;
+        read_desc(it + 1, &dn);
+        if (dn.tile >= 0) rcn = row_consts(dn);
+        pre = true;
+      };
+      if (d.steps == 0) {
+        // No live row in this tile: dQ = 0 for every row in range (DqPipeKernel's dead tile).
+        if (rc.in) {
+          Elem* dqrow = reinterpret_cast<Elem*>(p.dq) +
+                        ((rc.b * p.q_length + rc.i) * p.query_heads + rc.hq) * p.qk_dim;
+          const int64_t half = (p.qk_dim + 1) / 2;
+          const int64_t c_begin = ch == 0 ? 0 : half;
+          const int64_t c_end = ch == 0 ? half : p.qk_dim;
+          for (int64_t c = c_begin; c < c_end; ++c) dqrow[c] = ElemTraits<Elem>::From(0.f);
+        }
+        prefetch(true);
+        release_desc(it);
+        d = dn;
+        rc = rcn;
+        continue;
+      }
+      auto visibility = [&](int64_t kb, bool full, int cb) -> uint32_t {
+        uint32_t vis = 0u;
+        if (rc.lse_ok) {
+          if (full) {
+            vis = 0xFFFFFFFFu;
+          } else {
+            const int64_t base = kb + cb;
+            const int64_t lo_r = static_cast<int64_t>(rc.bd.lo) - base;
+            const int64_t hi_r = static_cast<int64_t>(rc.bd.hi) - base;
+            if (hi_r >= 0 && lo_r <= 31) {
+              const int a = lo_r < 0 ? 0 : static_cast<int>(lo_r);
+              const int z = hi_r > 31 ? 31 : static_cast<int>(hi_r);
+              vis = (0xFFFFFFFFu >> (31 - z)) & (0xFFFFFFFFu << a);
+            }
+            if (rc.seg && vis != 0u) {
+#pragma unroll 8
+              for (int x = 0; x < 32; ++x) {
+                if (kseg_g[cb + x] != rc.qseg) vis &= ~(1u << x);
+              }
+            }
+          }
+        }
+        return vis;
+      };
+      auto pack_cols = [&](uint32_t buf, int cb, uint32_t vis) {
+        float s[32];
+        float dpr[32];
+        TmemLoad32(lane_base | (tbase + Pl::kSCol + buf * Pl::kBufCols + cb), s);
+        TmemLoad32(lane_base | (tbase + Pl::kDpCol + buf * Pl::kBufCols + cb), dpr);
+        TmemWaitLd();
+        uint32_t dsv[kHalf / 2];
+        const float2 sl2v = make_float2(sl2, sl2);
+        const float2 nlse2 = make_float2(-rc.lse_log2, -rc.lse_log2);
+        const float2 dlt2 = make_float2(rc.delta, rc.delta);
+        if (__all_sync(0xFFFFFFFFu, vis == 0xFFFFFFFFu)) {
+#pragma unroll
+          for (int c2 = 0; c2 < kHalf; c2 += 2) {
+            const float2 e = pt::FmaX2(make_float2(s[c2], s[c2 + 1]), sl2v, nlse2);
+            const float2 pp = make_float2(pt::FastExp2(e.x), pt::FastExp2(e.y));
+            const float2 dd = pt::MulX2(pp, pt::SubX2(make_float2(dpr[c2], dpr[c2 + 1]), dlt2));
+            dsv[c2 >> 1] = pt::Pack2Fast<Elem>::Of(dd.x, dd.y);
+          }
+        } else {
+#pragma unroll
+          for (int c2 = 0; c2 < kHalf; c2 += 2) {
+            const bool v0 = ((vis >> c2) & 1u) != 0u;
+            const bool v1 = ((vis >> (c2 + 1)) & 1u) != 0u;
+            const float2 e = pt::FmaX2(make_float2(s[c2], s[c2 + 1]), sl2v, nlse2);
+            const float2 pp = make_float2(pt::FastExp2(e.x), pt::FastExp2(e.y));
+            const float2 dd = pt::MulX2(pp, pt::SubX2(make_float2(dpr[c2], dpr[c2 + 1]), dlt2));
+            dsv[c2 >> 1] = pt::Pack2Fast<Elem>::Of(v0 ? dd.x : 0.f, v1 ? dd.y : 0.f);
+          }
+        }
+        TmemStore16(lane_base | (tbase + DsBase(Pl::kSCol, buf) + static_cast<uint32_t>(cb)), dsv);
+      };
+      // This group's steps of the tile: global g with g & 1 == grp.
+      const int n0 = static_cast<int>((static_cast<uint32_t>(grp) - (G & 1u)) & 1u);
+      for (int n = n0; n < d.steps; n += 2) {
+        const uint32_t g = G + n;
+        const uint32_t buf = g & 1u;
+        const int64_t kb = static_cast<int64_t>(d.t0 + n) * kBN;
+        const bool full = TileIsFull(rc.seg, kb, d.max_lo, d.min_hi);
+        if (rc.seg && !full) {
+          const int gt = tid - 4 * 32 * grp;
+          GroupBarrierSync(grp);
+          if (gt < kBN) {
+            const int64_t j = kb + gt;
+            kseg_g[gt] = j < nt_total ? p.k_segment[rc.b * nt_total + j] : (rc.qseg + 1);
+          }
+          GroupBarrierSync(grp);
+        }
+        const uint32_t vis0 = visibility(kb, full, 0);
+        const uint32_t vis1 = visibility(kb, full, kHalf);
+        MbarWait(XATTN_DQF_BAR(kBarS + buf), (g >> 1) & 1u);
+        TmemFenceAfterSync();
+        pack_cols(buf, 0, vis0);
+        pack_cols(buf, kHalf, vis1);
+        TmemWaitSt();
+        TmemFenceBeforeSync();
+        MbarArrive(XATTN_DQF_BAR(kBarPack + buf));
+        prefetch(false);
+      }
+      prefetch(true);
+      // ----------------------------------------------------------------- epilogue
+      // dQ(last - 1) (when the tile has it) and then dQ(last): see the parity argument in the
+      // flat form's header comment (each wait's previous phase completed before it is taken).
+      const uint32_t gl = G + d.steps - 1;
+      if (d.steps >= 2) {
+        MbarWait(XATTN_DQF_BAR(kBarDq + ((gl - 1) & 1u)), ((gl - 1) >> 1) & 1u);
+      }
+      MbarWait(XATTN_DQF_BAR(kBarDq + (gl & 1u)), (gl >> 1) & 1u);
+      TmemFenceAfterSync();
+      float o[kD / 2];
+      const int cbeg = ch * (kD / 2);
+#pragma unroll
+      for (int cc = 0; cc < kD / 2; cc += 32) {
+        float t[32];
+        TmemLoad32(lane_base | (tbase + Pl::kDqCol + cbeg + cc), t);
+        TmemWaitLd();
+#pragma unroll
+        for (int x = 0; x < 32; ++x) o[cc + x] = t[x];
+      }
+      TmemFenceBeforeSync();
+      MbarArrive(XATTN_DQF_XBAR(Fp::kBarDrained));
+      release_desc(it);
+      if (rc.in) {
+        Elem* const dqrow =
+            reinterpret_cast<Elem*>(p.dq) + ((rc.b * p.q_length + rc.i) * p.query_heads + rc.hq) * p.qk_dim;
+        const float scale = p.scale;
+        for (int cc = 0; cc < kD / 2; cc += 32) {
+          const int col0 = cbeg + cc;
+          if (col0 + 32 <= p.qk_dim && (reinterpret_cast<uintptr_t>(dqrow + col0) & 15u) == 0u) {
+            union {
+              uint4 u4[4];
+              Elem e[32];
+            } pk;
+#pragma unroll
+            for (int x = 0; x < 32; ++x) pk.e[x] = ElemTraits<Elem>::From(rc.lse_ok ? o[cc + x] * scale : 0.f);
+            uint4* const dst = reinterpret_cast<uint4*>(dqrow + col0);
+            dst[0] = pk.u4[0];
+            dst[1] = pk.u4[1];
+            dst[2] = pk.u4[2];
+            dst[3] = pk.u4[3];
+          } else {
+            for (int x = 0; x < 32; ++x) {
+              const int64_t col = col0 + x;
+              if (col >= p.qk_dim) break;
+              dqrow[col] = ElemTraits<Elem>::From(rc.lse_ok ? o[cc + x] * scale : 0.f);
+            }
+          }
+        }
+      }
+      G += d.steps;
+      ++live_i;
+      d = dn;
+      rc = rcn;
+    }
+  }
+
+  TmemFenceBeforeSync();
+  __syncthreads();
+  TmemFenceAfterSync();
+  if (warp == 0) TmemDealloc(tbase, Pl::kAllocCols);
+#undef XATTN_DQF_BAR
+#undef XATTN_DQF_XBAR
+}
+
+// XATTN_SCA_DQ_FLAT: "0" keeps DqPipeKernel at the maps the flat form serves (a dev A/B switch,
+// read per call; unset in every gate check, so the gate runs the flat form).
+inline bool DqFlatEnabled() {
+  const char* v = std::getenv("XATTN_SCA_DQ_FLAT");
+  return v == nullptr || v[0] != '0';
+}
+
 // ------------------------------------------------------------------ host
 // Called by LaunchUmmaDq<E, kD, kDv> at either instantiated bucket, only AFTER
 // CanLaunchUmmaDq<E, kD, kDv> accepted the call
@@ -1297,7 +1946,23 @@ void LaunchDqPipeKernel(const UmmaLaunchParams& lp, cudaStream_t stream) {
   if (blocks < 1) blocks = 1;
   unsigned int* const counter = DqPipeTileCounter(stream);
   const dim3 grid(static_cast<unsigned>(blocks));
-  
+  if constexpr (FlatPlan<kD, kDv>::kEligible) {
+    if (DqFlatEnabled()) {
+      const cudaError_t fattr = cudaFuncSetAttribute(
+          DqFlatKernel<E, kD, kDv>, cudaFuncAttributeMaxDynamicSharedMemorySize, Pl::kSmemBytes);
+      if (fattr != cudaSuccess) {
+        dq_detail::RaiseCuda("flash_sca native bwd dQ flat: cudaFuncSetAttribute", fattr);
+      }
+      DqFlatKernel<E, kD, kDv><<<grid, FlatPlan<kD, kDv>::kThreads, Pl::kSmemBytes, stream>>>(
+          lp, counter, total_tiles);
+      const cudaError_t flaunched = cudaGetLastError();
+      if (flaunched != cudaSuccess) {
+        dq_detail::RaiseCuda("flash_sca native bwd dQ flat: kernel launch", flaunched);
+      }
+      return;
+    }
+  }
+
   DqPipeKernel<E, kD, kDv><<<grid, Pl::kThreads, Pl::kSmemBytes, stream>>>(lp, counter, total_tiles);
   const cudaError_t launched = cudaGetLastError();
   if (launched != cudaSuccess) {

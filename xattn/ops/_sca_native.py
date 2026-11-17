@@ -714,6 +714,52 @@ def private_fwd(q, k, v, chunk_size, scale, prev_k, prev_v, q_segment_idx, k_seg
 
 
 @torch.no_grad()
+def softdelta_pair_bwd(dy, q, k, v, y, lse, s_dy, s_q, s_y, s_lse, chunk_size, scale,
+                       q_segment_idx, k_segment_idx, reset, bos_mask=None, delta=None,
+                       s_delta=None):
+    """The native SoftDelta backward of both reads over the same K/V in one call: the grouped read
+    (``q``, ``dy``, ``y``, ``lse``) and the strict-past read (``s_q`` the read keys ``[B, Nq, Hkv,
+    D]``, ``s_dy``, ``s_y``, ``s_lse``), the strict read taken by the grouped read's key leaf as one
+    more reader of each KV head. ``(dq, dk, dv, dk_read)`` with dk / dv the sum of both reads,
+    rounded once; None when the call is not eligible (no such op, or the native preflight refused),
+    nothing having run.
+
+    ``bos_mask``, when the caller's own call used a BOS mask rather than a resolved segment id,
+    is read by both reads' ``visibility()`` instead of ``q_segment_idx`` / ``k_segment_idx``: the
+    same one-launch-or-zero-launch native route the forward already takes (``Visibility.bos_mask``),
+    not the segment-id chain over ids that were only resolved because some other reader of the
+    call's arguments (the fused path, or a caller giving explicit segment ids) needs them.
+
+    ``delta`` / ``s_delta`` (FP32 ``[B, Hq, Nq]`` / ``[B, Hkv, Nq]``), when given, are the two
+    reads' rowsum(dY * O) in the preprocessing's summation order (the SoftDelta gate backward's
+    ``_softdelta_gate_bwd_deltas``); ``y`` / ``s_y`` are then None: the reads are not needed, and
+    the preprocessing writes only its tile tables."""
+    ops = _extension_ops()
+    op = getattr(ops, "_flash_sca_native_softdelta_pair_bwd", None)
+    if op is None:
+        return None
+    total = _validate(q, k, v, None, None, chunk_size, "default", "_flash_sca_bwd")
+    if bos_mask is not None:
+        meta = visibility(q, total, chunk_size, bos_mask=bos_mask, reset=reset, strict=False)
+        s_meta = visibility(s_q, total, chunk_size, bos_mask=bos_mask, reset=reset, strict=True)
+    else:
+        meta = visibility(q, total, chunk_size, q_segment_idx=q_segment_idx,
+                          k_segment_idx=k_segment_idx, reset=reset, strict=False)
+        s_meta = visibility(s_q, total, chunk_size, q_segment_idx=q_segment_idx,
+                            k_segment_idx=k_segment_idx, reset=reset, strict=True)
+    if (meta.bos_mask is None) != (s_meta.bos_mask is None):
+        return None
+    out = op(dy, q, k, v, y, lse, s_dy, s_q, s_y, s_lse, chunk_size, float(scale),
+             meta.q_segment_idx, meta.k_segment_idx, meta.segment_exact, meta.row_lo, meta.row_hi,
+             s_meta.row_lo, s_meta.row_hi, bos_mask=meta.bos_mask, delta=delta,
+             strict_delta=s_delta)
+    if not out:
+        return None
+    record_native_leaf("sca_bwd", q, 0)
+    return tuple(out)
+
+
+@torch.no_grad()
 def private_bwd(y_grad, q, k, v, y, lse, chunk_size, scale, prev_k, prev_v, q_segment_idx,
                 k_segment_idx, deterministic, reset_chunk_pos_per_seq, *, attn_method,
                 cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, position_offsets,

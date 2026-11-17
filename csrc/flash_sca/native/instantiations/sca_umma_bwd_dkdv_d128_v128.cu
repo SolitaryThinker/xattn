@@ -4,6 +4,7 @@
 // sm_103a cubin comes from the ordinary package build, not only from a probe.
 #include "flash_sca/native/umma_bwd_dkdv.cuh"
 #include "flash_sca/native/umma_bwd_kv_pipe.cuh"
+#include "flash_sca/native/umma_bwd_kv_r128.cuh"
 
 XATTN_UMMA_BWD_DKDV_INSTANTIATE(__nv_bfloat16, 128, 128)
 XATTN_UMMA_BWD_DKDV_INSTANTIATE(__half, 128, 128)
@@ -38,6 +39,37 @@ bool InSituKvPipeWouldLaunch(const UmmaLaunchParams& lp) {
       lp.params.element == Element::kBFloat16 ? DecideInSituKeyPair<__nv_bfloat16, 128, 128>(lp)
                                               : DecideInSituKeyPair<__half, 128, 128>(lp);
   return decision == InSituKeyPairDecision::kKvPipe;
+}
+
+// The companion key leaf (kv_companion.h): the strict read as one more reader of the grouped
+// read's key pass, at this bucket's two element types.
+bool CanLaunchUmmaBackwardKvPipeCompanion(const UmmaLaunchParams& lp) {
+  if (lp.params.element == Element::kBFloat16) {
+    return CanLaunchUmmaBackwardKvPipeCompanionT<__nv_bfloat16>(lp);
+  }
+  if (lp.params.element == Element::kHalf) return CanLaunchUmmaBackwardKvPipeCompanionT<__half>(lp);
+  return false;
+}
+
+bool LaunchUmmaBackwardKvPipeCompanion(const UmmaLaunchParams& lp, const KvCompanion& comp,
+                                       cudaStream_t stream) {
+#if XATTN_KV_R128
+  // H29: the companion key leaf in 128-query rounds (umma_bwd_kv_r128.cuh).
+  if (lp.params.element == Element::kBFloat16) {
+    return LaunchUmmaBackwardKvR128CompanionT<__nv_bfloat16>(lp, comp, stream);
+  }
+  if (lp.params.element == Element::kHalf) {
+    return LaunchUmmaBackwardKvR128CompanionT<__half>(lp, comp, stream);
+  }
+#else
+  if (lp.params.element == Element::kBFloat16) {
+    return LaunchUmmaBackwardKvPipeCompanionT<__nv_bfloat16>(lp, comp, stream);
+  }
+  if (lp.params.element == Element::kHalf) {
+    return LaunchUmmaBackwardKvPipeCompanionT<__half>(lp, comp, stream);
+  }
+#endif
+  return false;
 }
 
 }  // namespace xattn::ops::flash_sca_native::umma
