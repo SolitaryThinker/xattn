@@ -440,10 +440,12 @@ __global__ void __launch_bounds__(kThreads, 1) BackwardDvPipeKernel(
           uint32_t* pvp = pv + 16 * (blk & 1);
           if (full) {
             pt::MakePtBlockFullPSoA<E, pt::kBlock>(s, &smeta_lse2[c0], p.scale_log2, pvp);
-          } else if (suffix_ok || smeta_blk[blk] != 0) {
+          } else if ((suffix_ok && smeta[c0].lo <= smeta[c0].hi) || smeta_blk[blk] != 0) {
             // For key row j the visible query columns are a suffix of the 32-column block
             // (lo constant, hi slope 1, one segment: pt::SuffixMask, pt::BlockIsSuffix), for
-            // the whole launch by the analytic guard or for this block by its metadata.
+            // the whole launch by the analytic guard or for this block by its metadata. The
+            // analytic guard also needs the block's first column live (an empty row is
+            // {INT_MAX, -1}: a strict-past read's first query), as in the dK leaf.
             const uint32_t mask = pt::BlockSuffixMask(j, smeta[c0].hi, smeta[c0].lo,
                                                       smeta[c0].segment, ks, seg, pt::kBlock);
             pt::MakePtBlockSuffixPSoA<E, pt::kBlock>(s, &smeta_lse2[c0], mask, p.scale_log2, pvp);

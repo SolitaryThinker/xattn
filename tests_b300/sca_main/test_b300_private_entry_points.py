@@ -9,8 +9,8 @@ conftest.py proves it for every test) and are deterministic whatever ``determini
 says.
 
 Checked against the FP64 reference with the oracle's tolerances (sca_main_reference):
-strict-past and inclusive reads, FP32 dK/dV, previous K/V, segment ids (sorted, as a BOS
-mask gives them, and not), batched varlen runs, reset positions, short Q, empty rows, FP16
+strict-past and inclusive reads, FP32 dK/dV, previous K/V, dense metadata and segment ids (sorted,
+as a BOS mask gives them, and not), batched varlen runs, reset positions, short Q, empty rows, FP16
 and BF16, grouped and ungrouped heads; and the determinism trio on every case: the forward
 repeats bit-exactly, the backward repeats bit-exactly from the same and from a fresh
 forward, and deterministic=False returns the bits of deterministic=True; high_precision (the level-1
@@ -91,6 +91,11 @@ READS = (
     Read('umma-128-previous', 512, 512, 128, 128, span=256, previous=True, batch=1),
     Read('umma-256-short', 384, 1024, 256, 256, span=256, metadata='segment', batch=1,
          segment_length=301),
+    # Dense metadata at the D = 256 key bucket with a chunk that is a multiple of 32 and Q aligned
+    # to K: the key leaves' analytic suffix mask, whose first block holds the strict-past read's
+    # empty first query.
+    Read('umma-256-dense', 256, 256, 256, 256, span=64, batch=1),
+    Read('umma-192-dense', 150, 150, 192, 192, span=32),
     # The queries are the keys (xattn's SoftDelta default read keys, k_read=None): one tensor
     # for the ungrouped read, the keys repeated over each group otherwise.
     Read('self-read', 512, 512, 128, 128, span=256, metadata='sorted', batch=1, segment_length=301,

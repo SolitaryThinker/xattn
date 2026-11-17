@@ -545,11 +545,15 @@ __global__ void __launch_bounds__(kThreads, 1) BackwardDkPipeKernel(
       uint32_t mask;
       if (full) {
         mask = ~0u;
-      } else if (suffix_ok || smeta_blk[ch] != 0) {
+      } else if ((suffix_ok && smeta_lo[c0] <= smeta_hi[c0]) || smeta_blk[ch] != 0) {
         // The visible columns of this key row are a suffix of the 32-column block (lo
         // constant, hi slope 1, one segment - see pt::SuffixMask, pt::BlockIsSuffix): for
         // the whole launch by the analytic guard, or for this block by its staged metadata.
-        // Two scalars and a shift in place of the per-column compares.
+        // Two scalars and a shift in place of the per-column compares. The analytic guard
+        // also needs the block's first column live: RowBounds encodes an empty row as
+        // {INT_MAX, -1}, which a strict-past read gives its first query (position 0), and
+        // a suffix built from that column would drop the whole block; such a block takes
+        // the per-block test, which it fails, and the general mask.
         mask = pt::BlockSuffixMask(j, smeta_hi[c0], smeta_lo[c0], smeta_seg[c0], ks, seg,
                                    pt::kBlock);
       } else {
