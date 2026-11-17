@@ -35,6 +35,7 @@ row's key segment ids are not sorted, a per-key segment equality test.
 from dataclasses import dataclass
 from typing import Optional
 
+import os
 import torch
 from torch import Tensor
 
@@ -76,7 +77,17 @@ def selected(q, backend, api_name: str) -> bool:
             f"{api_name} backend='native' requires a Blackwell GPU; device "
             f"{q.device} has compute capability {major}.{minor}"
         )
-    if major < _BLACKWELL_MAJOR or name not in _NATIVE_NAMES:
+    if major < _BLACKWELL_MAJOR:
+        return False
+    if name not in _NATIVE_NAMES:
+        # Strict mode: on capability 10.x only the native kernels or the explicitly requested PyTorch reference
+        # ('torch') run; any other backend would be a non-native route. XLLM_ALLOW_FALLBACK=1 allows it.
+        if major == _BLACKWELL_MAJOR and name != "torch" and os.environ.get("XLLM_ALLOW_FALLBACK", "") in ("", "0"):
+            raise RuntimeError(
+                f"{api_name} backend={backend!r} would take a non-native sliding-chunk route on {q.device} "
+                f"(compute capability {major}.{minor}); q: {tuple(q.shape)} {q.dtype}. Strict mode raises instead "
+                "of running the fallback; set XLLM_ALLOW_FALLBACK=1 to allow it."
+            )
         return False
     ops = _extension_ops()
     if ops is None or not hasattr(ops, "_flash_sca_native_fwd"):
