@@ -77,10 +77,11 @@ class ScopedForwardBody {
   ForwardBody saved_;
 };
 
-// The calls the pipelined body serves: level 0 (the plain softmax form, no FP32 state),
-// D = Dv in {256, 128} exactly - the two buckets that instantiate it, each with a native forward
-// leaf whose prepared maps are the ones it reads, so the width is what its plan is built for and
-// TryLaunchPipe picks the body by qk_dim - and at least one query row. FP16 and BF16 are the only
+// The calls the pipelined body serves: level 0 (the plain softmax form, no FP32 state), every
+// (D, Dv) the native forward's maps describe (params.h IsUmmaForwardDims: each in 8..256 and a
+// multiple of 8; a dim below its 64/128/256 bucket is zero-filled by the TMA and its stores keep
+// the logical extent; every bucket pair has an instantiation, picked by the launcher's bucket) -
+// and at least one query row. FP16 and BF16 are the only
 // element types Params carries. Levels 1-4 keep the forward they had. Previous K/V is served (the
 // split and packed maps of the leaf), so the traced prefill calls at both widths take this body.
 // Not in this predicate: the ORDER/LAYOUT exclusion. XATTN_SCA_ORDER and XATTN_SCA_LAYOUT=hf
@@ -91,8 +92,7 @@ class ScopedForwardBody {
 // Such a caller that resolves no body leaves ForwardBodySlot() at kGeneric, and the pipelined body
 // does not launch.
 inline bool PipeAccepts(const Params& p) {
-  const bool bucket =
-      (p.qk_dim == 256 && p.value_dim == 256) || (p.qk_dim == 128 && p.value_dim == 128);
+  const bool bucket = IsUmmaForwardDims(p.qk_dim, p.value_dim);
   return !p.subtract_before_scale && p.y_state == nullptr && bucket && p.q_length > 0;
 }
 

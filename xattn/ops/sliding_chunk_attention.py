@@ -21,6 +21,7 @@ from ._segment_metadata import (
 from ._varlen_metadata import validate_packed_qkv
 from ._native_dispatch import record_route, route_traced
 from . import _sca_native
+from . import _native_dispatch
 from ._sca_segment_alignment import (
     needs_matched_reset as _needs_matched_reset,
     matched_forward as _matched_reset_forward,
@@ -2469,6 +2470,17 @@ def flash_sca_fwd(
     ``high_precision_level=1`` runs the softmax in high precision, also in
     no_grad/inference mode. No autograd bridge is created.
     """
+    # A repeat of a call whose metadata already took the native BOS-mask route goes straight to
+    # the extension, which builds and checks the call's key (everything the checks below read)
+    # in the same crossing; the route records are the full path's (_sca_native.mask_forward_fast).
+    if bos_mask is not None:
+        fast = _sca_native.mask_forward_fast(
+            q, k, v, chunk_size, scale, prev_k, prev_v, q_segment_idx, k_segment_idx,
+            segment_idx, bos_mask, backend, reset_chunk_pos_per_seq, attn_method,
+            high_precision_level)
+        if fast is not None:
+            return fast
+        del fast  # locals() below are the re-dispatched call's arguments
     validate_high_precision_level(high_precision_level, api_name="flash_sca_fwd")
     validate_attention_scale(scale)
     validate_sm90_dimensions(q, v, backend, api_name="flash_sca_fwd")
@@ -2482,6 +2494,7 @@ def flash_sca_fwd(
             k_segment_idx, segment_idx=segment_idx, bos_mask=bos_mask,
             reset_chunk_pos_per_seq=reset_chunk_pos_per_seq,
             attn_method=attn_method, high_precision_level=high_precision_level,
+            fast_backend=backend if bos_mask is not None else None,
         )
     if _needs_matched_reset(q, q_segment_idx, k_segment_idx,
                             reset_chunk_pos_per_seq, segment_idx, bos_mask):
@@ -2613,6 +2626,49 @@ def flash_sca_fwd(
         attn_method=attn_method,
         **output_options,
     )
+
+
+_flash_sca_fwd_routed = flash_sca_fwd
+
+
+def flash_sca_fwd(
+    q: Tensor,
+    k: Tensor,
+    v: Tensor,
+    chunk_size: int,
+    scale: Optional[float] = None,
+    prev_k: Optional[Tensor] = None,
+    prev_v: Optional[Tensor] = None,
+    q_segment_idx: Optional[Tensor] = None,
+    k_segment_idx: Optional[Tensor] = None,
+    *,
+    segment_idx: Optional[Tensor] = None,
+    bos_mask: Optional[Tensor] = None,
+    backend: str = "auto",
+    reset_chunk_pos_per_seq: bool = False,
+    attn_method: str = "default",
+    high_precision_level: int = 0,
+) -> Tuple[Tensor, Tensor]:
+    # With route tracing off, a BOS-mask call tries the extension's repeat-call key in this frame:
+    # a hit returns the extension's (y, lse) with no other Python frame; a miss, or tracing on,
+    # runs the routed entry point, which records the route and takes the same key or the full path.
+    if bos_mask is not None and not _native_dispatch._TRACE_ENABLED:
+        ops = _sca_native._FAST_OPS
+        if ops is not None:
+            fast = ops._flash_sca_native_fwd_fast(
+                q, k, v, chunk_size, scale, prev_k, prev_v, q_segment_idx, k_segment_idx,
+                segment_idx, bos_mask, backend, reset_chunk_pos_per_seq, attn_method,
+                high_precision_level)
+            if fast is not None:
+                return fast
+    return _flash_sca_fwd_routed(
+        q, k, v, chunk_size, scale, prev_k, prev_v, q_segment_idx, k_segment_idx,
+        segment_idx=segment_idx, bos_mask=bos_mask, backend=backend,
+        reset_chunk_pos_per_seq=reset_chunk_pos_per_seq, attn_method=attn_method,
+        high_precision_level=high_precision_level)
+
+
+flash_sca_fwd.__doc__ = _flash_sca_fwd_routed.__doc__
 
 
 @route_traced("flash_sca_bwd", "backward")

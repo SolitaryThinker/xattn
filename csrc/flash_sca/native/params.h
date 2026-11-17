@@ -150,17 +150,31 @@ struct Params {
   bool key_grads_fp32 = false;
 };
 
-// The (D, Dv) buckets with an instantiated tcgen05/UMMA forward leaf
-// (instantiations/sca_umma_fwd_d128_v128.cu and sca_umma_fwd_d256_v256.cu).
-// The one list: host.cc's HasUmmaForwardLeaf, which decides whether a call's
-// TMA maps are prepared (and whether XATTN_SCA_UMMA_FWD=1 may be honoured), and
-// launch.cuh's kUmmaForwardLeaf, which decides whether a bucket consumes them,
-// both read it, so the two decisions cannot drift apart.
-constexpr bool IsUmmaForwardLeafBucket(int64_t qk_dim, int64_t value_dim) {
-  return (qk_dim == 128 && value_dim == 128) || (qk_dim == 256 && value_dim == 256);
+// Which calls the native tcgen05/UMMA forward serves. Two predicates, one rule:
+// host.cc's HasUmmaForwardLeaf reads IsUmmaForwardDims on the call's logical dims (whether its TMA
+// maps are prepared, and whether XATTN_SCA_UMMA_FWD=1 may be honoured), and launch.cuh's
+// kUmmaForwardLeaf reads IsUmmaForwardLeafBucket on the (QkBucket, ValueBucket) pair the dims
+// dispatch to (whether that bucket consumes them). Every dim IsUmmaForwardDims admits buckets to a
+// pair IsUmmaForwardLeafBucket admits, so a prepared call always reaches a native launcher.
+constexpr bool IsUmmaForwardBucketWidth(int64_t w) { return w == 64 || w == 128 || w == 256; }
+
+// Every (D, Dv) bucket pair of 64/128/256 has a leaf launcher
+// (instantiations/sca_umma_fwd_d<D>_v<Dv>.cu, ForwardKernel<E, D, Dv>), and that launcher tries
+// the pipelined body (instantiations/sca_umma_fwd_pipe_d<D>_v<Dv>.cu) first.
+constexpr bool IsUmmaForwardLeafBucket(int64_t d_bucket, int64_t dv_bucket) {
+  return IsUmmaForwardBucketWidth(d_bucket) && IsUmmaForwardBucketWidth(dv_bucket);
 }
 
-void LaunchTileBounds(Params& params, cudaStream_t stream);
+// The logical dims whose calls the native forward serves: each in 8..256 and a multiple of 8 (a
+// TMA row of 16-bit elements is a multiple of 16 bytes). A dim that is not a bucket width is
+// padded to its bucket (QkBucket / ValueBucket) by the TMA's zero fill of the last 64-column box.
+constexpr bool IsUmmaForwardDims(int64_t qk_dim, int64_t value_dim) {
+  return qk_dim >= 8 && qk_dim <= 256 && qk_dim % 8 == 0 && value_dim >= 8 && value_dim <= 256 &&
+         value_dim % 8 == 0;
+}
+
+
+void LaunchTileBounds(const Params& params, cudaStream_t stream);
 void LaunchKeyTileRange(Params& params, cudaStream_t stream);
 void LaunchForward(const Params& params, cudaStream_t stream);
 void LaunchBackward(const Params& params, cudaStream_t stream);

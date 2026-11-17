@@ -128,8 +128,10 @@
 
 #include <ATen/ATen.h>
 #include <ATen/cuda/CUDAContext.h>
+#include <ATen/cuda/EmptyTensor.h>
 #include <c10/cuda/CUDAGuard.h>
 #include <c10/util/Exception.h>
+#include <torch/csrc/autograd/python_variable.h>
 
 #include <atomic>
 #include <cmath>
@@ -147,6 +149,7 @@
 #include "flash_sca/native/dispatch_tag.cuh"
 #include "flash_sca/native/params.h"
 #include "flash_sca/native/registration.h"
+#include "flash_sca/native/row_bounds.h"
 #include "flash_sca/native/umma_bwd.h"
 #include "flash_sca/native/umma_fwd_pipe_host.h"
 #include "flash_sca/native/umma_prepare.h"
@@ -553,8 +556,15 @@ Prepared PrepareCommon(const at::Tensor& q, const at::Tensor& k, const at::Tenso
   p.scale_log2 = static_cast<float>(scale * 1.4426950408889634);
   p.strict = strict;
   p.tile_count = (Nq + 63) / 64;
-  out.tile_bounds = at::empty({B, p.tile_count, 4}, q.options().dtype(at::kInt));
-  p.tile_bounds = out.tile_bounds.data_ptr<int32_t>();
+  // Params::tile_bounds is NOT built here: the tile-bounds table is read only by the bodies
+  // that walk 64-row key tiles through it (the generic mma.sync forward, the older native
+  // leaf, umma_tile_mask.h, and the backward's key leaves), and the pipelined forward derives
+  // its tile walk from the per-row bounds in-kernel (umma_fwd_pipe.cuh: RowBounds -> min_lo /
+  // max_hi), so it reads no table. Each caller therefore builds the table for the bodies it
+  // resolved to, right before the call that consumes it: host.cc Forward does so only for a
+  // body other than kPipe (and keeps it under the scheduling instruments, which resolve
+  // kGeneric), Backward builds it for every schedule, and a call whose body reads no table
+  // pays neither the allocation nor the LaunchTileBounds launch.
   return out;
 }
 
@@ -598,7 +608,7 @@ UmmaForwardArm UmmaForwardArmOptIn() {
 // allocates), and `launch.cuh` cannot be included here without pulling every
 // kernel body into this translation unit, so both read the one list in params.h.
 bool HasUmmaForwardLeaf(int64_t qk_dim, int64_t value_dim) {
-  return IsUmmaForwardLeafBucket(qk_dim, value_dim);
+  return IsUmmaForwardDims(qk_dim, value_dim);
 }
 
 // The two forward arms of one call, XATTN_SCA_FWD_PIPE (umma_fwd_pipe_host.h) and
@@ -648,20 +658,76 @@ umma::fwdpipe::ForwardBody ResolveForwardBody(const ForwardArms& arms, bool pipe
   return pipe_accepts && !order_instrument ? ForwardBody::kPipe : ForwardBody::kGeneric;
 }
 
+// Defined below, next to RowBounds: the mask-side metadata boundary (row_bounds.h).
+std::tuple<at::Tensor, at::Tensor> RowBoundsFromMask(const at::Tensor& mask, int64_t q_length,
+                                                     int64_t total, int64_t chunk_size,
+                                                     bool strict);
+void CheckRowBoundsMaskArgs(const at::Tensor& mask, int64_t q_length, int64_t total,
+                            int64_t chunk_size);
+void LaunchRowBoundsMaskInto(const at::Tensor& mask_c, int64_t q_length, int64_t total,
+                             int64_t chunk_size, bool strict, int32_t* lo, int32_t* hi);
+
+// A contiguous, uninitialized CUDA tensor from the CUDA caching allocator: what at::empty makes
+// for these options, without the operator dispatch at::empty goes through first.
+at::Tensor EmptyCuda(at::IntArrayRef size, at::ScalarType dtype, at::Device device) {
+  return at::detail::empty_cuda(size, dtype, device, std::nullopt);
+}
+
 std::tuple<at::Tensor, at::Tensor> Forward(
     const at::Tensor& q, const at::Tensor& k, const at::Tensor& v, const OptionalTensor& prev_k,
     const OptionalTensor& prev_v, int64_t chunk_size, double scale,
     const OptionalTensor& q_segment, const OptionalTensor& k_segment,
     const OptionalTensor& segment_exact, const OptionalTensor& row_lo,
     const OptionalTensor& row_hi, bool strict, bool subtract_before_scale,
-    const OptionalTensor& output_state) {
+    const OptionalTensor& output_state, const OptionalTensor& bos_mask) {
   c10::cuda::CUDAGuard guard(q.device());
   // Both forward arms, parsed ONCE for this call and first: every refusal of an arm value, or of
   // a combination of the two, raises here, before anything is allocated (ParseForwardArms).
   const ForwardArms arms = ParseForwardArms();
+  // A BOS mask given here is the whole metadata boundary: this call derives the row bounds from
+  // it in one metadata launch, so the caller passes no bounds and makes no metadata call.
+  //
+  // The mask route's three int32 metadata arrays - row lo [B, Nq], row hi [B, Nq] and the
+  // tile-bounds table [B, ceil(Nq/64), 4] - are one allocation, addressed by raw offsets (each
+  // segment starts on a 256-byte boundary; no ATen view is made of it). The row bounds are
+  // written by the same launch as before; the checks and their order are RowBoundsFromMask's
+  // and PrepareCommon's (the row-bounds device check runs after PrepareCommon's, where its
+  // check of row bound tensors ran).
+  at::Tensor mask_meta;
+  int32_t* meta_lo = nullptr;
+  int32_t* meta_hi = nullptr;
+  int32_t* meta_tiles = nullptr;
+  if (bos_mask) {
+    TORCH_CHECK(!row_lo.has_value() && !row_hi.has_value(),
+                "native FlashSCA takes row bounds or a BOS mask, not both");
+    TORCH_CHECK(bos_mask->dim() == 2 && bos_mask->size(0) == q.size(0) &&
+                    bos_mask->size(1) >= q.size(1),
+                "native FlashSCA bos_mask must be [B, Nt] with Nt >= Nq; got ",
+                bos_mask->sizes(), " for q of ", q.sizes());
+    const int64_t Nq = q.size(1), total = bos_mask->size(1);
+    CheckRowBoundsMaskArgs(*bos_mask, Nq, total, chunk_size);
+    const int64_t B = bos_mask->size(0);
+    constexpr int64_t kAlignInts = 64;  // 256 bytes
+    const int64_t row_span = (B * Nq + kAlignInts - 1) / kAlignInts * kAlignInts;
+    const int64_t tile_ints = B * ((Nq + 63) / 64) * 4;
+    c10::cuda::CUDAGuard mask_guard(bos_mask->device());
+    at::Tensor mask_c = bos_mask->contiguous();
+    mask_meta = EmptyCuda({2 * row_span + tile_ints}, at::kInt, bos_mask->device());
+    int32_t* const base = mask_meta.data_ptr<int32_t>();
+    meta_lo = base;
+    meta_hi = base + row_span;
+    meta_tiles = base + 2 * row_span;
+    LaunchRowBoundsMaskInto(mask_c, Nq, total, chunk_size, strict, meta_lo, meta_hi);
+  }
   Prepared prepared = PrepareCommon(q, k, v, prev_k, prev_v, chunk_size, scale, q_segment,
                                     k_segment, segment_exact, row_lo, row_hi, strict);
   Params& p = prepared.params;
+  if (mask_meta.defined()) {
+    CheckDevice(mask_meta, q, "row bounds");
+    prepared.row_lo = mask_meta;  // holds the storage of the three arrays to the end of the call
+    p.row_lo = meta_lo;
+    p.row_hi = meta_hi;
+  }
   p.subtract_before_scale = subtract_before_scale;
   const OrderArm order_arm = OrderArmOptIn();
   p.sorted_order = order_arm != OrderArm::kNone;
@@ -681,7 +747,7 @@ std::tuple<at::Tensor, at::Tensor> Forward(
     TORCH_CHECK(false,
                 "XATTN_SCA_UMMA_FWD=1 requires a native forward leaf, and this build has none "
                 "for D=", p.qk_dim, ", Dv=", p.value_dim,
-                " (the buckets with a leaf are (128,128) and (256,256))");
+                " (the native forward serves D and Dv in 8..256, multiples of 8)");
   }
   TORCH_CHECK(!(fwd_arm == UmmaForwardArm::kRequire && order_instrument),
               "XATTN_SCA_UMMA_FWD=1 cannot be combined with XATTN_SCA_ORDER or "
@@ -696,8 +762,9 @@ std::tuple<at::Tensor, at::Tensor> Forward(
                 "XATTN_SCA_ORDER supports at most 768 query tiles per batch row (q_length <= "
                 "98304); got q_length=", p.q_length);
   }
-  auto y = at::empty({p.batch, p.q_length, p.query_heads, p.value_dim}, q.options());
-  auto lse = at::empty({p.batch, p.query_heads, p.q_length}, q.options().dtype(at::kFloat));
+  auto y = EmptyCuda({p.batch, p.q_length, p.query_heads, p.value_dim}, q.scalar_type(),
+                     q.device());
+  auto lse = EmptyCuda({p.batch, p.query_heads, p.q_length}, at::kFloat, q.device());
   if (output_state) {
     CheckDevice(*output_state, q, "output_state");
     TORCH_CHECK(output_state->scalar_type() == at::kFloat && output_state->is_contiguous() &&
@@ -728,6 +795,16 @@ std::tuple<at::Tensor, at::Tensor> Forward(
         p, prepared.q, prepared.k, prepared.v,
         prev_k ? OptionalTensor(prepared.prev_k) : OptionalTensor{},
         prev_v ? OptionalTensor(prepared.prev_v) : OptionalTensor{}, std::nullopt);
+    // The y map the epilogue's staged TMA store writes through, encoded only for the pipelined
+    // body that stores through it - the non-pipelined native leaf (`kLeaf`) shares these maps but
+    // never reads this one, and must not pay the driver call. y is allocated here, contiguous
+    // [B, Nq, Hq, Dv] and 256 B aligned, so it needs no canonicalization; the map's extent is the
+    // logical one, so a box past Nq or past Dv is clipped by the TMA.
+    if (body == umma::fwdpipe::ForwardBody::kPipe) {
+      umma_call.launch.maps.y =
+          umma::EncodeInputMap(umma::bwd_host::MakeOperand(y), p.element, p.batch, p.q_length,
+                               p.query_heads, p.value_dim);
+    }
     p.umma_maps = &umma_call.launch.maps;
   }
   // This thread's own count of forward umma -> umma/ran rows, not the process
@@ -737,7 +814,23 @@ std::tuple<at::Tensor, at::Tensor> Forward(
   };
   const int64_t umma_ran_before = umma_ran();
   const cudaStream_t stream = at::cuda::getCurrentCUDAStream(q.get_device());
-  LaunchTileBounds(p, stream);
+  // The tile-bounds table is the generic and older-leaf bodies' key-tile walk; the pipelined
+  // body walks key tiles from min_lo / max_hi derived per row in-kernel and reads no table
+  // (umma_fwd_pipe.cuh). Build and launch the table for a body that reads it, so a pipelined
+  // forward pays neither the [B, ceil(Nq/64), 4] allocation nor the metadata launch. `body`
+  // is the one value both this preparation and the launch site below read, and a live
+  // scheduling instrument resolved kGeneric above, so an instrumented call keeps the table.
+  // The table is allocated for every body (an allocation, no launch), so a pipelined call that
+  // the pipe refuses before its launch can fall back to the generic body with a table to read:
+  // LaunchUmmaForward fills it on that refusal (umma_fwd.cuh). The mask route's table is the
+  // third segment of its one metadata allocation (above).
+  if (mask_meta.defined()) {
+    p.tile_bounds = meta_tiles;
+  } else {
+    prepared.tile_bounds = at::empty({p.batch, p.tile_count, 4}, q.options().dtype(at::kInt));
+    p.tile_bounds = prepared.tile_bounds.data_ptr<int32_t>();
+  }
+  if (body != umma::fwdpipe::ForwardBody::kPipe) LaunchTileBounds(p, stream);
   {
     // The resolved body, visible to the launch site for exactly this call's launches.
     const umma::fwdpipe::ScopedForwardBody resolved(body);
@@ -762,13 +855,224 @@ std::tuple<at::Tensor, at::Tensor> Forward(
   return {y, lse};
 }
 
+// The BOS-mask training route of Forward: the mask is the whole metadata boundary, so the fields
+// the Python boundary would otherwise hand over are null here - no row bounds, no segment planes,
+// no output state, not strict, level 0. Same preparation, launches, numbers and counters.
+std::tuple<at::Tensor, at::Tensor> ForwardMask(
+    const at::Tensor& q, const at::Tensor& k, const at::Tensor& v, const OptionalTensor& prev_k,
+    const OptionalTensor& prev_v, int64_t chunk_size, double scale, const at::Tensor& bos_mask) {
+  return Forward(q, k, v, prev_k, prev_v, chunk_size, scale, std::nullopt, std::nullopt,
+                 std::nullopt, std::nullopt, std::nullopt, /*strict=*/false,
+                 /*subtract_before_scale=*/false, std::nullopt, OptionalTensor(bos_mask));
+}
+
+// ---------------------------------------------------------------- repeat-call key
+// The public flash_sca_fwd's memo of the BOS-mask level-0 training route, built and checked
+// here, inside the one pybind crossing of the call, from the raw Python arguments. A key holds
+// every value the public entry's checks (precision level, scale, dimensions, the non-positive
+// scale branch, `selected`) and _sca_native._mask_forward_route read: each operand's exact
+// type (a torch.Tensor, not a subclass), sizes, dtype and device; the mask's contiguity; the
+// absence of segment arguments; and every scalar argument with its exact Python type and value.
+// Those checks are pure functions of the key and of the process, so a key the full Python path
+// once ran to the mask route's extension call (it is learned there, by
+// _flash_sca_native_fwd_fast_learn) runs there again; any other call is a miss, returns None
+// and takes the full path, with its records and its errors. Nothing that depends on tensor
+// contents or data pointers is decided here: ForwardMask validates, allocates and prepares
+// every call. Bounded (cleared whole when full); read and written under the GIL.
+struct FastTensorMeta {
+  int dim = -1;
+  int64_t sizes[4] = {0, 0, 0, 0};
+  int dtype = -1;
+  int dev_type = -1;
+  int dev_index = -1;
+  bool operator==(const FastTensorMeta& o) const {
+    return dim == o.dim && dtype == o.dtype && dev_type == o.dev_type &&
+           dev_index == o.dev_index && sizes[0] == o.sizes[0] && sizes[1] == o.sizes[1] &&
+           sizes[2] == o.sizes[2] && sizes[3] == o.sizes[3];
+  }
+};
+
+struct FastKey {
+  FastTensorMeta q, k, v, prev_k, prev_v, mask;
+  bool mask_contiguous = false;
+  int64_t chunk = 0;
+  int scale_kind = 0;  // 0 None, 1 float, 2 int
+  double scale_float = 0.0;
+  int64_t scale_int = 0;
+  int64_t level = 0;
+  bool reset = false;
+  std::string backend, attn_method;
+};
+
+constexpr size_t kFastKeysMax = 64;
+std::vector<FastKey> g_fast_keys;
+
+bool FastMetaOf(PyObject* o, FastTensorMeta* m) {
+  if (!THPVariable_CheckExact(o)) return false;
+  const at::Tensor& t = THPVariable_Unpack(o);
+  const int64_t d = t.dim();
+  if (d > 4) return false;
+  m->dim = static_cast<int>(d);
+  for (int64_t i = 0; i < d; ++i) m->sizes[i] = t.size(i);
+  m->dtype = static_cast<int>(t.scalar_type());
+  m->dev_type = static_cast<int>(t.device().type());
+  m->dev_index = static_cast<int>(t.device().index());
+  return true;
+}
+
+bool FastInt(PyObject* o, int64_t* out) {
+  if (!PyLong_CheckExact(o)) return false;
+  int overflow = 0;
+  const long long v = PyLong_AsLongLongAndOverflow(o, &overflow);
+  if (overflow != 0 || (v == -1 && PyErr_Occurred())) {
+    PyErr_Clear();
+    return false;
+  }
+  *out = static_cast<int64_t>(v);
+  return true;
+}
+
+bool FastStr(PyObject* o, const char** s, Py_ssize_t* n) {
+  if (!PyUnicode_CheckExact(o)) return false;
+  *s = PyUnicode_AsUTF8AndSize(o, n);
+  if (*s == nullptr) {
+    PyErr_Clear();
+    return false;
+  }
+  return true;
+}
+
+// The call's key, or false when the call is never memoised (and so always takes the full path).
+// The strings are compared in place (backend_s / attn_s point into the Python objects).
+struct FastCall {
+  FastKey key;  // backend / attn_method left empty; compared through the views below
+  const char* backend_s = nullptr;
+  Py_ssize_t backend_n = 0;
+  const char* attn_s = nullptr;
+  Py_ssize_t attn_n = 0;
+};
+
+bool BuildFastCall(py::handle q, py::handle k, py::handle v, py::handle chunk, py::handle scale,
+                   py::handle prev_k, py::handle prev_v, py::handle q_segment,
+                   py::handle k_segment, py::handle segment, py::handle mask, py::handle backend,
+                   py::handle reset, py::handle attn_method, py::handle level, FastCall* c) {
+  FastKey& key = c->key;
+  if (mask.is_none() || !q_segment.is_none() || !k_segment.is_none() || !segment.is_none()) {
+    return false;
+  }
+  if (!FastInt(chunk.ptr(), &key.chunk) || !FastInt(level.ptr(), &key.level)) return false;
+  if (scale.is_none()) {
+    key.scale_kind = 0;
+  } else if (PyFloat_CheckExact(scale.ptr())) {
+    key.scale_kind = 1;
+    key.scale_float = PyFloat_AS_DOUBLE(scale.ptr());
+  } else if (FastInt(scale.ptr(), &key.scale_int)) {
+    key.scale_kind = 2;
+  } else {
+    return false;
+  }
+  if (reset.ptr() == Py_True) {
+    key.reset = true;
+  } else if (reset.ptr() == Py_False) {
+    key.reset = false;
+  } else {
+    return false;
+  }
+  if (!FastStr(backend.ptr(), &c->backend_s, &c->backend_n) ||
+      !FastStr(attn_method.ptr(), &c->attn_s, &c->attn_n)) {
+    return false;
+  }
+  if (!FastMetaOf(q.ptr(), &key.q) || !FastMetaOf(k.ptr(), &key.k) ||
+      !FastMetaOf(v.ptr(), &key.v) || !FastMetaOf(mask.ptr(), &key.mask)) {
+    return false;
+  }
+  if (!prev_k.is_none() || !prev_v.is_none()) {
+    if (!FastMetaOf(prev_k.ptr(), &key.prev_k) || !FastMetaOf(prev_v.ptr(), &key.prev_v)) {
+      return false;
+    }
+  }
+  key.mask_contiguous = THPVariable_Unpack(mask.ptr()).is_contiguous();
+  return true;
+}
+
+bool FastSame(const FastCall& c, const FastKey& s) {
+  const FastKey& a = c.key;
+  return a.q == s.q && a.k == s.k && a.v == s.v && a.mask == s.mask && a.prev_k == s.prev_k &&
+         a.prev_v == s.prev_v && a.mask_contiguous == s.mask_contiguous && a.chunk == s.chunk &&
+         a.scale_kind == s.scale_kind &&
+         (a.scale_kind != 1 || a.scale_float == s.scale_float) &&  // NaN never matches
+         (a.scale_kind != 2 || a.scale_int == s.scale_int) && a.level == s.level &&
+         a.reset == s.reset && static_cast<size_t>(c.backend_n) == s.backend.size() &&
+         std::memcmp(c.backend_s, s.backend.data(), s.backend.size()) == 0 &&
+         static_cast<size_t>(c.attn_n) == s.attn_method.size() &&
+         std::memcmp(c.attn_s, s.attn_method.data(), s.attn_method.size()) == 0;
+}
+
+bool FastKnown(const FastCall& c) {
+  for (const FastKey& s : g_fast_keys) {
+    if (FastSame(c, s)) return true;
+  }
+  return false;
+}
+
+#define XATTN_FAST_ARGS                                                                      \
+  py::handle q, py::handle k, py::handle v, py::handle chunk, py::handle scale,              \
+      py::handle prev_k, py::handle prev_v, py::handle q_segment, py::handle k_segment,      \
+      py::handle segment, py::handle mask, py::handle backend, py::handle reset,             \
+      py::handle attn_method, py::handle level
+#define XATTN_FAST_PASS                                                                     \
+  q, k, v, chunk, scale, prev_k, prev_v, q_segment, k_segment, segment, mask, backend, reset, \
+      attn_method, level
+
+// A memoised call: ForwardMask's (y, lse), under no_grad as the full path runs it; else None.
+py::object ForwardFast(XATTN_FAST_ARGS) {
+  FastCall c;
+  if (!BuildFastCall(XATTN_FAST_PASS, &c) || !FastKnown(c)) return py::none();
+  const at::Tensor& qt = THPVariable_Unpack(q.ptr());
+  // _sca_native._scale: 1.0 / q.shape[-1] ** 0.5 for None (Python's float pow is the C pow),
+  // else float(scale).
+  const double s = c.key.scale_kind == 0
+                       ? 1.0 / std::pow(static_cast<double>(qt.size(-1)), 0.5)
+                       : (c.key.scale_kind == 1 ? c.key.scale_float
+                                                : static_cast<double>(c.key.scale_int));
+  OptionalTensor pk, pv;
+  if (!prev_k.is_none()) {
+    pk = THPVariable_Unpack(prev_k.ptr());
+    pv = THPVariable_Unpack(prev_v.ptr());
+  }
+  at::Tensor y, lse;
+  {
+    at::NoGradGuard no_grad;
+    std::tie(y, lse) = ForwardMask(qt, THPVariable_Unpack(k.ptr()), THPVariable_Unpack(v.ptr()),
+                                   pk, pv, c.key.chunk, s, THPVariable_Unpack(mask.ptr()));
+  }
+  return py::make_tuple(y, lse);
+}
+
+bool ForwardFastHit(XATTN_FAST_ARGS) {
+  FastCall c;
+  return BuildFastCall(XATTN_FAST_PASS, &c) && FastKnown(c);
+}
+
+void ForwardFastLearn(XATTN_FAST_ARGS) {
+  FastCall c;
+  if (!BuildFastCall(XATTN_FAST_PASS, &c) || FastKnown(c)) return;
+  if (g_fast_keys.size() >= kFastKeysMax) g_fast_keys.clear();
+  FastKey key = c.key;
+  key.backend.assign(c.backend_s, static_cast<size_t>(c.backend_n));
+  key.attn_method.assign(c.attn_s, static_cast<size_t>(c.attn_n));
+  g_fast_keys.push_back(std::move(key));
+}
+#undef XATTN_FAST_ARGS
+#undef XATTN_FAST_PASS
+
 std::tuple<at::Tensor, at::Tensor, at::Tensor, OptionalTensor, OptionalTensor> Backward(
     const at::Tensor& dy, const at::Tensor& q, const at::Tensor& k, const at::Tensor& v,
     const OptionalTensor& prev_k, const OptionalTensor& prev_v, const at::Tensor& saved,
     const at::Tensor& lse, int64_t chunk_size, double scale, const OptionalTensor& q_segment,
     const OptionalTensor& k_segment, const OptionalTensor& segment_exact,
     const OptionalTensor& row_lo, const OptionalTensor& row_hi, bool strict,
-    bool requested_deterministic, bool fp32_kv_grads) {
+    bool requested_deterministic, bool fp32_kv_grads, const OptionalTensor& bos_mask) {
   // B300 supports only deterministic SCA: every backward takes the fixed-order schedule
   // (kFusedKey family, row-owned direct dQ, no FP32 atomic dQ accumulator) whatever the
   // caller's flag says. The flag stays in the signature for API compatibility only.
@@ -788,8 +1092,25 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, OptionalTensor, OptionalTensor> B
               "XATTN_SCA_BWD_DQ_PIPE must be unset, empty, '0' or '1'; got '",
               std::string(dq_pipe_value != nullptr ? dq_pipe_value : ""), "'");
   c10::cuda::CUDAGuard guard(q.device());
+  // A BOS mask given here is the whole metadata boundary (see Forward): one metadata launch in
+  // this call, and the caller passes no row bounds.
+  at::Tensor mask_lo, mask_hi;
+  OptionalTensor lo_arg = row_lo;
+  OptionalTensor hi_arg = row_hi;
+  if (bos_mask) {
+    TORCH_CHECK(!row_lo.has_value() && !row_hi.has_value(),
+                "native FlashSCA takes row bounds or a BOS mask, not both");
+    TORCH_CHECK(bos_mask->dim() == 2 && bos_mask->size(0) == q.size(0) &&
+                    bos_mask->size(1) >= q.size(1),
+                "native FlashSCA bos_mask must be [B, Nt] with Nt >= Nq; got ",
+                bos_mask->sizes(), " for q of ", q.sizes());
+    std::tie(mask_lo, mask_hi) =
+        RowBoundsFromMask(*bos_mask, q.size(1), bos_mask->size(1), chunk_size, strict);
+    lo_arg = mask_lo;
+    hi_arg = mask_hi;
+  }
   Prepared prepared = PrepareCommon(q, k, v, prev_k, prev_v, chunk_size, scale, q_segment,
-                                    k_segment, segment_exact, row_lo, row_hi, strict);
+                                    k_segment, segment_exact, lo_arg, hi_arg, strict);
   Params& p = prepared.params;
   CheckDevice(dy, q, "y_grad");
   CheckDevice(saved, q, "saved output");
@@ -834,6 +1155,11 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, OptionalTensor, OptionalTensor> B
   p.dk = dk.data_ptr();
   p.dv = dv.data_ptr();
   if (p.batch == 0) return {dq, dk, dv, dprev_k, dprev_v};
+  // The backward's key leaves walk 64-row key tiles through Params::tile_bounds, so this route
+  // builds the table for every schedule it may take (generic or native) - PrepareCommon no
+  // longer allocates it, because the pipelined forward reads none.
+  prepared.tile_bounds = at::empty({p.batch, p.tile_count, 4}, q.options().dtype(at::kInt));
+  p.tile_bounds = prepared.tile_bounds.data_ptr<int32_t>();
   // The arm decides whether dQ is reduced inside the dK/dV kernels (the branch's own
   // allocation and fold both read `!deterministic && !split`). Hoisted above the plan
   // call so `deterministic || split` is its exact complement, and read ONCE: the opt-in
@@ -994,6 +1320,100 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, OptionalTensor, OptionalTensor> B
   g_last_backward.launched = true;
   g_backward_launches.fetch_add(1, std::memory_order_relaxed);
   return {dq, dk, dv, dprev_k, dprev_v};
+}
+
+std::tuple<at::Tensor, at::Tensor> RowBounds(const at::Tensor& ids, int64_t q_length,
+                                             int64_t total, int64_t chunk_size, bool strict) {
+  // The fused visible-bounds reduction of the metadata boundary (row_bounds.h). Its input is
+  // the caller's key segment id plane [B, Nt], nondecreasing per row - the BOS mask's cumsum,
+  // which is what xattn/ops/_sca_native.py builds - and the two integers the Python route
+  // applies to the query positions. The outputs are the int32 [B, Nq] row bounds the forward
+  // and the backward take, so the Python boundary can answer with ONE launch instead of its
+  // ~14-kernel chain (cumsum, arange, div, clamp, two searchsorted, max, min, two int32 casts,
+  // contiguous). Integers only and the sorted branch's formula verbatim: bit for bit the same
+  // bounds. No float, no reduction order, no atomics - nothing here can differ between runs.
+  TORCH_CHECK(ids.is_cuda() && ids.dim() == 2 && ids.scalar_type() == at::kLong,
+              "native FlashSCA row bounds need int64 [B, Nt] key segment ids");
+  TORCH_CHECK(total == ids.size(1), "native FlashSCA row bounds: ids must be [B, total]; got Nt=",
+              ids.size(1), ", total=", total);
+  TORCH_CHECK(chunk_size > 0, "native FlashSCA row bounds chunk_size must be positive");
+  TORCH_CHECK(q_length > 0 && q_length <= total,
+              "native FlashSCA row bounds need 0 < q_length <= total; got q_length=", q_length,
+              ", total=", total);
+  const int64_t B = ids.size(0);
+  c10::cuda::CUDAGuard guard(ids.device());
+  at::Tensor ids_c = ids.contiguous();
+  auto lo = at::empty({B, q_length}, ids.options().dtype(at::kInt));
+  auto hi = at::empty({B, q_length}, ids.options().dtype(at::kInt));
+  if (B == 0) return {lo, hi};
+  RowBoundsArgs args;
+  args.ids = ids_c.data_ptr<int64_t>();
+  args.row_lo = lo.data_ptr<int32_t>();
+  args.row_hi = hi.data_ptr<int32_t>();
+  args.batch = B;
+  args.q_length = q_length;
+  args.total = total;
+  args.chunk = chunk_size;
+  args.strict = strict ? 1 : 0;
+  LaunchRowBounds(args, at::cuda::getCurrentCUDAStream(ids.get_device()));
+  return {lo, hi};
+}
+
+void CheckRowBoundsMaskArgs(const at::Tensor& mask, int64_t q_length, int64_t total,
+                            int64_t chunk_size) {
+  // RowBoundsFromMask's argument checks, in its order (the forward's mask route makes them too).
+  TORCH_CHECK(mask.is_cuda() && mask.dim() == 2 && mask.scalar_type() == at::kBool,
+              "native FlashSCA derives row bounds from a bool [B, Nt] BOS mask");
+  TORCH_CHECK(total == mask.size(1),
+              "native FlashSCA row bounds: the BOS mask must be [B, total]; got Nt=",
+              mask.size(1), ", total=", total);
+  TORCH_CHECK(chunk_size > 0, "native FlashSCA chunk_size must be positive");
+  TORCH_CHECK(q_length > 0 && q_length <= total,
+              "native FlashSCA row bounds need 0 < q_length <= total; got q_length=", q_length,
+              ", total=", total);
+  TORCH_CHECK(total <= kMaskMaxKeys,
+              "native FlashSCA derives row bounds from a BOS mask only up to ", kMaskMaxKeys,
+              " keys per row; got total=", total);
+}
+
+void LaunchRowBoundsMaskInto(const at::Tensor& mask_c, int64_t q_length, int64_t total,
+                             int64_t chunk_size, bool strict, int32_t* lo, int32_t* hi) {
+  // The row-bounds launch over a contiguous mask into int32 [B, q_length] lo / hi at the given
+  // device addresses (on the mask's device; the caller holds the current device and the
+  // storage), after CheckRowBoundsMaskArgs. B == 0 launches nothing.
+  const int64_t B = mask_c.size(0);
+  if (B == 0) return;
+  RowBoundsMaskArgs args;
+  args.mask = reinterpret_cast<const uint8_t*>(mask_c.data_ptr<bool>());
+  args.row_lo = lo;
+  args.row_hi = hi;
+  args.batch = B;
+  args.q_length = q_length;
+  args.total = total;
+  args.chunk = chunk_size;
+  args.strict = strict ? 1 : 0;
+  LaunchRowBoundsMask(args, at::cuda::getCurrentCUDAStream(mask_c.get_device()));
+}
+
+std::tuple<at::Tensor, at::Tensor> RowBoundsFromMask(const at::Tensor& mask, int64_t q_length,
+                                                     int64_t total, int64_t chunk_size,
+                                                     bool strict) {
+  // The metadata boundary one step earlier (row_bounds.h): a BOS mask in, the int32 [B, Nq] row
+  // bounds out, with no cumsum, no bool->int64 cast and no ids plane built at all - the caller
+  // makes no metadata call and this extension launches one metadata kernel. A start of the mask
+  // is a segment start, so the ids route's lower_bound/upper_bound over the cumsum are the mask's
+  // last start at or before the query position and its next start after it; integers only, no
+  // float and no order-dependent reduction, so this route, the ids route and the Python chain
+  // agree bit for bit. Above kMaskMaxKeys keys the caller builds the ids and uses RowBounds.
+  CheckRowBoundsMaskArgs(mask, q_length, total, chunk_size);
+  const int64_t B = mask.size(0);
+  c10::cuda::CUDAGuard guard(mask.device());
+  at::Tensor mask_c = mask.contiguous();
+  auto lo = at::empty({B, q_length}, mask.options().dtype(at::kInt));
+  auto hi = at::empty({B, q_length}, mask.options().dtype(at::kInt));
+  LaunchRowBoundsMaskInto(mask_c, q_length, total, chunk_size, strict,
+                          lo.data_ptr<int32_t>(), hi.data_ptr<int32_t>());
+  return {lo, hi};
 }
 
 // The sm_103a cubin runs on compute capability 10.3 only.
@@ -1301,7 +1721,44 @@ void DefineNativeFlashSCAOps(py::module& m) {
            py::arg("chunk_size"), py::arg("scale"), py::arg("q_segment_idx"),
            py::arg("k_segment_idx"), py::arg("segment_exact"), py::arg("row_lo"),
            py::arg("row_hi"), py::arg("strict_past"), py::arg("subtract_before_scale"),
-           py::arg("output_state"))
+           py::arg("output_state"), py::arg("bos_mask") = py::none())
+      .def("_flash_sca_native_fwd_mask", &ForwardMask,
+           "The BOS-mask level-0 training route of _flash_sca_native_fwd, with the mask as the "
+           "whole metadata boundary: identical to _flash_sca_native_fwd(q, k, v, prev_k, prev_v, "
+           "chunk_size, scale, None, None, None, None, None, False, False, None, "
+           "bos_mask=mask) - same preparation, launches, numbers and counters - with eight "
+           "arguments instead of sixteen",
+           py::arg("q"), py::arg("k"), py::arg("v"), py::arg("prev_k"), py::arg("prev_v"),
+           py::arg("chunk_size"), py::arg("scale"), py::arg("bos_mask"))
+      .def("_flash_sca_native_fwd_fast", &ForwardFast,
+           "The public flash_sca_fwd's repeat-call route: from the call's raw arguments "
+           "(q, k, v, chunk_size, scale, prev_k, prev_v, q_segment_idx, k_segment_idx, "
+           "segment_idx, bos_mask, backend, reset_chunk_pos_per_seq, attn_method, "
+           "high_precision_level), the BOS-mask level-0 route's (y, lse) when its metadata key "
+           "was learned by _flash_sca_native_fwd_fast_learn - the same _flash_sca_native_fwd_mask "
+           "call the full path makes, under no_grad - else None (the caller takes the full path)")
+      .def("_flash_sca_native_fwd_fast_hit", &ForwardFastHit,
+           "Whether _flash_sca_native_fwd_fast would serve these arguments (same arguments); "
+           "launches nothing")
+      .def("_flash_sca_native_fwd_fast_learn", &ForwardFastLearn,
+           "Remember the metadata key of a call (same arguments) that the full path ran to the "
+           "BOS-mask level-0 extension call; a call that is never memoised is ignored. At most "
+           "64 keys, cleared whole when full")
+      .def("_flash_sca_native_fwd_fast_clear", [] { g_fast_keys.clear(); },
+           "Forget every learned repeat-call key")
+      .def("_flash_sca_native_fwd_fast_size",
+           [] { return static_cast<int64_t>(g_fast_keys.size()); },
+           "How many repeat-call keys are learned")
+      .def("_flash_sca_native_row_bounds", &RowBounds,
+           "Per-query-row visible key bounds (row_lo, row_hi) as int32 [B, Nq] from key "
+           "segment ids [B, Nt] that are nondecreasing per row (a BOS mask's cumsum), in ONE "
+           "launch: the sorted integer formula of xattn.ops._sca_native.visibility (chunk "
+           "bounds of the right-aligned query position intersected with the row's own "
+           "key-segment run; strict_past drops the query's own key). The values are integers, "
+           "so this agrees with the Python chain bit for bit; a row with row_lo > row_hi has no "
+           "visible key (zero output, zero gradient)",
+           py::arg("ids"), py::arg("q_length"), py::arg("total"), py::arg("chunk_size"),
+           py::arg("strict_past"))
       .def("_flash_sca_native_bwd", &Backward,
            "Native Blackwell FlashSCA backward; fp32_kv_grads (grouped query heads) returns "
            "dk/dv/dprev_k/dprev_v in FP32, the values the 16-bit outputs are rounded from",
@@ -1309,7 +1766,8 @@ void DefineNativeFlashSCAOps(py::module& m) {
            py::arg("prev_v"), py::arg("saved_output"), py::arg("lse"), py::arg("chunk_size"),
            py::arg("scale"), py::arg("q_segment_idx"), py::arg("k_segment_idx"),
            py::arg("segment_exact"), py::arg("row_lo"), py::arg("row_hi"),
-           py::arg("strict_past"), py::arg("deterministic"), py::arg("fp32_kv_grads") = false);
+           py::arg("strict_past"), py::arg("deterministic"), py::arg("fp32_kv_grads") = false,
+           py::arg("bos_mask") = py::none());
 }
 
 }  // namespace ops

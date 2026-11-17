@@ -520,6 +520,62 @@ inline at::Tensor CanonicalizeTmaInput(const at::Tensor& tensor) {
   return result;
 }
 
+// A repeat call's maps. A tensor map is a pure function of what EncodeInputMap reads - the
+// device it is encoded on, the source's base address and three strides, the element type and
+// the four extents (umma_host.h) - so a map encoded once for that complete key is the map a
+// fresh encode would produce, byte for byte. This per-thread cache of the last few keys lets a
+// call whose operands sit where the previous call's did skip the encode (and its cudaSetDevice):
+// a changed pointer, stride, dtype, extent or device is a different key and is encoded afresh.
+// The cache holds descriptors only (128-byte values), never a tensor or a device buffer.
+struct InputMapKey {
+  int device = -1;
+  const void* ptr = nullptr;
+  int64_t batch_stride = 0, row_stride = 0, head_stride = 0;
+  int element = 0;
+  int64_t batch = 0, rows = 0, heads = 0, columns = 0;
+  bool operator==(const InputMapKey& o) const {
+    return device == o.device && ptr == o.ptr && batch_stride == o.batch_stride &&
+           row_stride == o.row_stride && head_stride == o.head_stride && element == o.element &&
+           batch == o.batch && rows == o.rows && heads == o.heads && columns == o.columns;
+  }
+};
+
+inline CUtensorMap CachedInputMap(const Operand& source, Element element, int64_t batch,
+                                  int64_t rows, int64_t heads, int64_t columns) {
+  constexpr int kEntries = 8;
+  struct Entry {
+    InputMapKey key;
+    CUtensorMap map;
+    bool valid = false;
+  };
+  thread_local Entry entries[kEntries];
+  thread_local int next = 0;
+  int device = 0;
+  C10_CUDA_CHECK(cudaGetDevice(&device));
+  InputMapKey key;
+  key.device = device;
+  key.ptr = source.ptr;
+  key.batch_stride = source.batch_stride;
+  key.row_stride = source.row_stride;
+  key.head_stride = source.head_stride;
+  key.element = static_cast<int>(element);
+  key.batch = batch;
+  key.rows = rows;
+  key.heads = heads;
+  key.columns = columns;
+  for (const Entry& e : entries) {
+    if (e.valid && e.key == key) return e.map;
+  }
+  // A miss encodes exactly as before (and raises exactly as before on an invalid source).
+  const CUtensorMap map = EncodeInputMap(source, element, batch, rows, heads, columns);
+  Entry& slot = entries[next];
+  next = (next + 1) % kEntries;
+  slot.key = key;
+  slot.map = map;
+  slot.valid = true;
+  return map;
+}
+
 // Strong references remain live through launch submission on the caller's
 // current stream. Tensor maps contain addresses, not ownership of storage.
 struct PreparedUmmaCall {
@@ -567,23 +623,23 @@ inline PreparedUmmaCall PrepareUmmaCall(
   }
   if (p.batch == 0) return result;
 
-  maps.q = EncodeInputMap(p.q, p.element, p.batch, p.q_length, p.query_heads, p.qk_dim);
+  maps.q = CachedInputMap(p.q, p.element, p.batch, p.q_length, p.query_heads, p.qk_dim);
   maps.packed_kv = p.prev_length != 0 && p.prev_length % kKeyMapAlignment != 0;
   if (maps.packed_kv) {
     result.packed_k = at::cat({result.prev_k, result.k}, 1);
     result.packed_v = at::cat({result.prev_v, result.v}, 1);
-    maps.k = EncodeInputMap(bwd_host::MakeOperand(result.packed_k), p.element, p.batch,
+    maps.k = CachedInputMap(bwd_host::MakeOperand(result.packed_k), p.element, p.batch,
                             p.total_length, p.kv_heads, p.qk_dim);
-    maps.v = EncodeInputMap(bwd_host::MakeOperand(result.packed_v), p.element, p.batch,
+    maps.v = CachedInputMap(bwd_host::MakeOperand(result.packed_v), p.element, p.batch,
                             p.total_length, p.kv_heads, p.value_dim);
   } else {
-    maps.k = EncodeInputMap(p.k, p.element, p.batch, p.k_length, p.kv_heads, p.qk_dim);
-    maps.v = EncodeInputMap(p.v, p.element, p.batch, p.k_length, p.kv_heads, p.value_dim);
+    maps.k = CachedInputMap(p.k, p.element, p.batch, p.k_length, p.kv_heads, p.qk_dim);
+    maps.v = CachedInputMap(p.v, p.element, p.batch, p.k_length, p.kv_heads, p.value_dim);
     if (p.prev_length != 0) {
       maps.prev_k =
-          EncodeInputMap(p.prev_k, p.element, p.batch, p.prev_length, p.kv_heads, p.qk_dim);
+          CachedInputMap(p.prev_k, p.element, p.batch, p.prev_length, p.kv_heads, p.qk_dim);
       maps.prev_v =
-          EncodeInputMap(p.prev_v, p.element, p.batch, p.prev_length, p.kv_heads, p.value_dim);
+          CachedInputMap(p.prev_v, p.element, p.batch, p.prev_length, p.kv_heads, p.value_dim);
     }
   }
   if (dy) {

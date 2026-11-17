@@ -247,6 +247,44 @@ __device__ __forceinline__ void TmaLoadAtom(const CUtensorMap* map, uint32_t dst
       : "memory");
 }
 
+// ---------------------------------------------------------------------------
+// TMA store of one atom: cp.async.bulk.tensor.4d.global.shared::cta.bulk_group, coordinates
+// (d0, h, row0, b) through the same map EncodeInputMap builds (a tensor map is direction
+// agnostic; the extent is the logical one, so a box that reaches past it is clipped by the TMA -
+// rows past q_length and padded Dv columns are simply not written). The SMEM source must be in
+// the map's declared 128 B swizzle (SwizzleBytes below), and the caller must have fenced the
+// generic writes with FenceProxyAsyncShared before the barrier that precedes this call.
+//
+// Completion is by bulk group, not by mbarrier: TmaStoreCommit closes a group and
+// TmaStoreWaitRead waits until the SMEM it reads may be reused. Writing to global is complete for
+// the kernel's consumer when the kernel ends, so the epilogue waits on `.read`, not on the write.
+// ---------------------------------------------------------------------------
+__device__ __forceinline__ void TmaStoreAtom(const CUtensorMap* map, uint32_t src_smem, int d0,
+                                             int h, int row0, int b) {
+  asm volatile(
+      "cp.async.bulk.tensor.4d.global.shared::cta.bulk_group [%0, {%2, %3, %4, %5}], [%1];\n" ::
+          "l"(map),
+      "r"(src_smem), "r"(d0), "r"(h), "r"(row0), "r"(b)
+      : "memory");
+}
+
+__device__ __forceinline__ void TmaStoreCommit() {
+  asm volatile("cp.async.bulk.commit_group;" ::: "memory");
+}
+
+// Waits until every issued bulk-group read of shared memory is complete, i.e. until the staged
+// bytes may be overwritten or the CTA may exit without the copy engine reading a dead stage.
+__device__ __forceinline__ void TmaStoreWaitRead() {
+  asm volatile("cp.async.bulk.wait_group.read 0;" ::: "memory");
+}
+
+// Generic-proxy shared writes made visible to the async proxy (the TMA engine), then ordered
+// against the barrier that follows: this is the one fence a staged copy needs on the producer side
+// and it must precede the named barrier, not follow it.
+__device__ __forceinline__ void FenceProxyAsyncShared() {
+  asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
+}
+
 // A stage that carries more than one tile into one barrier arrives once with the
 // sum of their TileTxBytes (the dK leaf stages P and dO that way).
 //

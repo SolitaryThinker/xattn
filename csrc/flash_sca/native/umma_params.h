@@ -24,6 +24,10 @@ struct UmmaInputMaps {
   CUtensorMap prev_k{};
   CUtensorMap prev_v{};
   CUtensorMap dy{};
+  // The output map the forward's epilogue stores O through (TMA store, one box per 64-column
+  // slab and 64 rows). Encoded only for a forward call whose body is the pipelined one; the
+  // backward leaves it zero.
+  CUtensorMap y{};
 
   // False: k/v describe current K/V and prev_k/prev_v describe the previous
   // chunk when present. True: k/v describe the packed total [previous;current]

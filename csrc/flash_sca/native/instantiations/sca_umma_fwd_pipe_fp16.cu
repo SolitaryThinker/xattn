@@ -1,7 +1,4 @@
-// Native Blackwell FlashSCA pipelined forward (tcgen05/UMMA, warp-specialized), D = Dv = 256 and
-// D = Dv = 128, level 0, FP16: fwdpipe::TryLaunchPipe<__half> and its two kernels (one per
-// bucket), called by LaunchUmmaForward<__half, 256, 256> and <__half, 128, 128> (umma_fwd.cuh).
-// One element type per file so the build compiles the two in parallel.
+// The pipelined forward (fwdpipe::TryLaunchPipe<E, D, Dv>) is instantiated per bucket pair, beside
+// its leaf launcher, in sca_umma_fwd_d<D>_v<Dv>.cu. This TU instantiates nothing; it stays so that
+// probe scripts that prepend XATTN_FWD_PROBE_HOOKS to it keep finding it.
 #include "flash_sca/native/umma_fwd_pipe.cuh"
-
-XATTN_FWD_PIPE_INSTANTIATE(__half)

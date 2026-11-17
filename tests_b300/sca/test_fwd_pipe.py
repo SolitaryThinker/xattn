@@ -1,5 +1,10 @@
-"""Smoke test of the pipelined native forward at its two buckets, (256,256) and (128,128), level 0,
-and of the two forward arms.
+"""Smoke test of the pipelined native forward at level 0, and of the two forward arms.
+
+Which calls are covered: the square buckets D = Dv in {256, 128, 64} with every scale and previous
+kind; every (D, Dv) bucket pair and dims below their bucket (8..256, multiples of 8: PAIRS); the
+unequal (64, 128) pair (the `speed` check's mixed-64-128 guard row); and the directed tests (dead rows
+inside live CTAs, Nq < Nk, the late-max rescale/clear branches, the FULL-tile rule at chunks that
+are not multiples of the key tile) at the buckets of the timed and guarded rows (BUCKETS).
 
 What this file is NOT: the evidence that certifies the pipelined body. That evidence is the pinned,
 independent FP64 oracle at this body's shapes: gekko-shapes 12/12 on this head (the training cell and
@@ -131,15 +136,16 @@ def _bos_inputs(dtype, previous=0, new_document=False, dim=256, value_dim=None, 
     return _case(q, k, v, previous, chunk, {"bos_mask": bos}, mask)
 
 
-def _pair_dead_rows_inputs(dtype, length=300):
+def _pair_dead_rows_inputs(dtype, length=300, dim=256, value_dim=None):
     """The q/k segment-pair route with every 5th query row in a segment no key carries: rows with no
     visible key inside CTAs that have live rows (the contract's 'zero output, never NaN' clause on a
     mixed CTA, which a bos_mask cannot reach: every BOS segment starts with its own key)."""
     torch.manual_seed(1)
-    batch, heads, kv_heads, chunk, dim = 2, 2, 2, 64, 256
+    batch, heads, kv_heads, chunk = 2, 2, 2, 64
+    value_dim = dim if value_dim is None else value_dim
     q = F.normalize(torch.randn(batch, length, heads, dim, device="cuda"), dim=-1).to(dtype)
     k = F.normalize(torch.randn(batch, length, kv_heads, dim, device="cuda"), dim=-1).to(dtype)
-    v = (F.silu(torch.randn(batch, length, kv_heads, dim, device="cuda")) + 0.1).to(dtype)
+    v = (F.silu(torch.randn(batch, length, kv_heads, value_dim, device="cuda")) + 0.1).to(dtype)
     kseg = (100 - torch.arange(length, device="cuda") // 41).expand(batch, -1).contiguous()
     qseg = kseg.clone()
     qseg[:, ::5] = -7
@@ -147,7 +153,7 @@ def _pair_dead_rows_inputs(dtype, length=300):
     return _case(q, k, v, 0, chunk, {"q_segment_idx": qseg, "k_segment_idx": kseg}, mask)
 
 
-def _late_max_inputs(dtype, route, spike):
+def _late_max_inputs(dtype, route, spike, dim=256, value_dim=None):
     """Directed lazy-rescale inputs (D = Dv = 256, C = 128, scale 1, one CTA row-tile per 128 rows):
     every query leans on one direction u, and key j's projection on u rises 6 natural units per
     64-key tile (about 8.7 log2 units, around the kernel's 8-unit threshold given the queries' own
@@ -157,7 +163,8 @@ def _late_max_inputs(dtype, route, spike):
     whole tiles visible to whole CTAs (the FULL path); route 'pair' gives every 5th query row a segment
     no key carries (dead rows inside live CTAs; the masked path)."""
     g = torch.Generator(device="cuda").manual_seed(7)
-    batch, length, heads, kv_heads, dim, chunk = 1, 320, 2, 1, 256, 128
+    batch, length, heads, kv_heads, chunk = 1, 320, 2, 1, 128
+    value_dim = dim if value_dim is None else value_dim
     u = F.normalize(torch.randn(dim, device="cuda", generator=g), dim=0)
     q = F.normalize(torch.randn(batch, length, heads, dim, device="cuda", generator=g), dim=-1) + u
     proj = 6.0 * torch.arange(length, device="cuda", dtype=torch.float32) / 64.0
@@ -165,7 +172,7 @@ def _late_max_inputs(dtype, route, spike):
         proj[torch.tensor([200, 290, 319], device="cuda")] += 100.0
     k = F.normalize(torch.randn(batch, length, kv_heads, dim, device="cuda", generator=g), dim=-1)
     k = k + proj[None, :, None, None] * u
-    v = F.silu(torch.randn(batch, length, kv_heads, dim, device="cuda", generator=g)) + 0.1
+    v = F.silu(torch.randn(batch, length, kv_heads, value_dim, device="cuda", generator=g)) + 0.1
     q, k, v = q.to(dtype), k.to(dtype), v.to(dtype)
     kwargs, qseg, kseg = {}, None, None
     if route == "pair":
@@ -283,7 +290,7 @@ SCALES = (None, 0.0, 1.0 / 16, -1.0 / 16)
 @pytest.mark.parametrize("scale", SCALES, ids=("default", "zero", "pos", "neg"))
 @pytest.mark.parametrize("previous", ["none", "continued", "new-document"])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16], ids=("bf16", "fp16"))
-@pytest.mark.parametrize("dim", [256, 128], ids=("d256", "d128"))
+@pytest.mark.parametrize("dim", [256, 128, 64], ids=("d256", "d128", "d64"))
 def test_default_runs_the_pipelined_body_against_fp64(monkeypatch, dim, dtype, previous, scale):
     ops = _ops()
     x = _bos_inputs(dtype, previous=0 if previous == "none" else 128, new_document=previous == "new-document",
@@ -306,7 +313,29 @@ def test_default_runs_the_pipelined_body_against_fp64(monkeypatch, dim, dtype, p
     assert not _check_fp64(y0, lse0, x, ref_scale, dtype)
 
 
-@pytest.mark.parametrize("dim", [256, 128], ids=("d256", "d128"))
+PAIRS = ((64, 256), (128, 64), (128, 256), (256, 64), (256, 128), (96, 96), (32, 32), (192, 80),
+         (40, 136), (8, 8), (256, 24))
+
+
+@pytest.mark.parametrize("previous", ["none", "continued"])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16], ids=("bf16", "fp16"))
+@pytest.mark.parametrize("dims", PAIRS, ids=[f"d{d}v{v}" for d, v in PAIRS])
+def test_every_dim_pair_runs_the_pipelined_body_against_fp64(monkeypatch, dims, dtype, previous):
+    """Every (D, Dv) the native maps describe (8..256, multiples of 8) takes the pipelined body: the
+    unequal bucket pairs, and dims below their bucket (zero-filled by the TMA, stored at the logical
+    extent). Held to the FP64 oracle, and a repeat is bit-identical."""
+    ops = _ops()
+    dim, value_dim = dims
+    x = _bos_inputs(dtype, previous=0 if previous == "none" else 128, dim=dim, value_dim=value_dim)
+    y, lse, body = _forward(ops, monkeypatch, {}, x)
+    assert body == PIPE, (dims, body)
+    assert y.shape[-1] == value_dim
+    assert not _check_fp64(y, lse, x, dim ** -0.5, dtype), _check_fp64(y, lse, x, dim ** -0.5, dtype)
+    y2, lse2, _ = _forward(ops, monkeypatch, {}, x)
+    assert torch.equal(y, y2) and torch.equal(lse, lse2)
+
+
+@pytest.mark.parametrize("dim", [256, 128, 64], ids=("d256", "d128", "d64"))
 def test_default_repeats_bit_exactly_and_matches_inference_mode(monkeypatch, dim):
     ops = _ops()
     x = _bos_inputs(torch.bfloat16, previous=128, dim=dim)
@@ -333,7 +362,7 @@ def test_default_repeats_bit_exactly_and_matches_inference_mode(monkeypatch, dim
     ({"XATTN_SCA_FWD_PIPE": "0", "XATTN_SCA_UMMA_FWD": "0"}, GENERIC),
     ({"XATTN_SCA_FWD_PIPE": "0", "XATTN_SCA_UMMA_FWD": "1"}, LEAF),
 ])
-@pytest.mark.parametrize("dim", [256, 128], ids=("d256", "d128"))
+@pytest.mark.parametrize("dim", [256, 128, 64], ids=("d256", "d128", "d64"))
 def test_arm_precedence_selects_its_body(monkeypatch, dim, env, want):
     """The same precedence at both buckets: each has the pipelined body, the older leaf and the generic
     body, so the arms select the same body kind at (256,256) and at (128,128)."""
@@ -357,7 +386,7 @@ def test_conflicting_explicit_arms_raise_before_anything_runs(monkeypatch, umma)
     assert _body_delta(before, _counts(ops)) == NOTHING
 
 
-@pytest.mark.parametrize("case", ["level1", "d128-level1", "dv128", "order", "layout"])
+@pytest.mark.parametrize("case", ["level1", "d128-level1", "order", "layout"])
 @pytest.mark.parametrize("pipe", ["", "1"], ids=("pipe-unset", "pipe-1"))
 def test_calls_it_does_not_serve_run_mains_default(monkeypatch, case, pipe):
     """Calls PipeAccepts does not admit (level 1 at either bucket, D != Dv) and calls under a live
@@ -391,33 +420,85 @@ def test_values_that_name_no_arm_raise(monkeypatch, value, dim):
     assert _body_delta(before, _counts(ops)) == NOTHING
 
 
+# The bucket pairs of the timed and guarded rows, for the directed tests below: the square buckets and
+# the unequal (64, 128) pair (the `speed` check's mixed-64-128 guard row).
+BUCKETS = ((256, 256), (128, 128), (64, 64), (64, 128))
+BUCKET_IDS = ("d256", "d128", "d64", "d64v128")
+
+
+@pytest.mark.parametrize("scale", SCALES, ids=("default", "zero", "pos", "neg"))
+@pytest.mark.parametrize("previous", ["none", "continued", "new-document"])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16], ids=("bf16", "fp16"))
-def test_dead_rows_inside_live_ctas_on_the_segment_pair_route(monkeypatch, dtype):
+def test_unequal_dims_against_fp64(monkeypatch, dtype, previous, scale):
+    """(D, Dv) = (64, 128) with every scale and previous kind: the score is over D, the output over Dv,
+    and the O store and dead-row writes use the logical value extent."""
     ops = _ops()
-    x = _pair_dead_rows_inputs(dtype)
+    dim, value_dim = 64, 128
+    x = _bos_inputs(dtype, previous=0 if previous == "none" else 128,
+                    new_document=previous == "new-document", dim=dim, value_dim=value_dim)
+    ref_scale = dim ** -0.5 if scale is None else scale
+    y, lse, body = _forward(ops, monkeypatch, {}, x, scale)
+    assert body == PIPE, body
+    assert y.dtype == dtype and y.shape[-1] == value_dim
+    assert not _check_fp64(y, lse, x, ref_scale, dtype), _check_fp64(y, lse, x, ref_scale, dtype)
+    y2, lse2, _ = _forward(ops, monkeypatch, {}, x, scale)
+    assert torch.equal(y, y2) and torch.equal(lse, lse2)
+
+
+@pytest.mark.parametrize("chunk", [256, 200, 192, 130, 64])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16], ids=("bf16", "fp16"))
+@pytest.mark.parametrize("dims", BUCKETS, ids=BUCKET_IDS)
+def test_full_tile_rule_at_chunks_off_the_key_tile(monkeypatch, dims, dtype, chunk):
+    """The FULL-tile fast path at chunks that are not multiples of the key tile, with a whole previous
+    chunk (chunk = prev, N = 256): a FULL test narrower than the body's key tile admits a tile whose
+    second half lies past a row's last visible key, a silent wrong y/LSE (a randomized check found 106 and
+    120 bad rows of 256 at chunk 200 and 192 on the 128-key body). 256 is the aligned control."""
+    ops = _ops()
+    dim, value_dim = dims
+    torch.manual_seed(0)
+    n, heads, kv_heads = 256, 2, 2
+    total = chunk + n
+    q = F.normalize(torch.randn(1, n, heads, dim, device="cuda"), dim=-1).to(dtype)
+    k = F.normalize(torch.randn(1, total, kv_heads, dim, device="cuda"), dim=-1).to(dtype)
+    v = (F.silu(torch.randn(1, total, kv_heads, value_dim, device="cuda")) + 0.1).to(dtype)
+    x = _case(q, k, v, chunk, chunk, {}, _chunk_mask(n, total, chunk))
+    y, lse, body = _forward(ops, monkeypatch, {}, x)
+    assert body == PIPE, body
+    assert not _check_fp64(y, lse, x, dim ** -0.5, dtype), _check_fp64(y, lse, x, dim ** -0.5, dtype)
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16], ids=("bf16", "fp16"))
+@pytest.mark.parametrize("dims", BUCKETS, ids=BUCKET_IDS)
+def test_dead_rows_inside_live_ctas_on_the_segment_pair_route(monkeypatch, dtype, dims):
+    ops = _ops()
+    dim, value_dim = dims
+    x = _pair_dead_rows_inputs(dtype, dim=dim, value_dim=value_dim)
     dead = ~x["mask"].any(-1)  # [B, Nq]
     assert bool(dead.any()) and bool((~dead).any())
     y, lse, body = _forward(ops, monkeypatch, {}, x)
     assert body == PIPE, body
-    assert not _check_fp64(y, lse, x, 256 ** -0.5, dtype), _check_fp64(y, lse, x, 256 ** -0.5, dtype)
+    assert not _check_fp64(y, lse, x, dim ** -0.5, dtype), _check_fp64(y, lse, x, dim ** -0.5, dtype)
     y0, lse0, body0 = _forward(ops, monkeypatch, {"XATTN_SCA_FWD_PIPE": "0"}, x)
     assert body0 == GENERIC, body0
-    assert not _check_fp64(y0, lse0, x, 256 ** -0.5, dtype)
+    assert not _check_fp64(y0, lse0, x, dim ** -0.5, dtype)
 
 
 @pytest.mark.parametrize("previous", ["none", "continued"])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16], ids=("bf16", "fp16"))
-def test_fewer_queries_than_keys_right_aligned(monkeypatch, dtype, previous):
+@pytest.mark.parametrize("dims", BUCKETS, ids=BUCKET_IDS)
+def test_fewer_queries_than_keys_right_aligned(monkeypatch, dtype, previous, dims):
     """Unequal current lengths, Nq < Nk: Q is right-aligned to [previous; current] keys, so its first
     row sits at key position T - Nq, mid-chunk (333 - 200 = 133 with C = 128)."""
     ops = _ops()
-    x = _bos_inputs(dtype, previous=0 if previous == "none" else 128, q_length=200)
+    dim, value_dim = dims
+    x = _bos_inputs(dtype, previous=0 if previous == "none" else 128, q_length=200, dim=dim,
+                    value_dim=value_dim)
     y, lse, body = _forward(ops, monkeypatch, {}, x)
     assert body == PIPE, body
-    assert not _check_fp64(y, lse, x, 256 ** -0.5, dtype), _check_fp64(y, lse, x, 256 ** -0.5, dtype)
+    assert not _check_fp64(y, lse, x, dim ** -0.5, dtype), _check_fp64(y, lse, x, dim ** -0.5, dtype)
     y0, lse0, body0 = _forward(ops, monkeypatch, {"XATTN_SCA_FWD_PIPE": "0"}, x)
     assert body0 == GENERIC, body0
-    assert not _check_fp64(y0, lse0, x, 256 ** -0.5, dtype)
+    assert not _check_fp64(y0, lse0, x, dim ** -0.5, dtype)
 
 
 def test_more_queries_than_keys_is_refused_by_the_public_api(monkeypatch):
@@ -442,9 +523,10 @@ def test_more_queries_than_keys_is_refused_by_the_public_api(monkeypatch):
 @pytest.mark.parametrize("spike", [False, True], ids=("rescale", "clear"))
 @pytest.mark.parametrize("route", ["dense", "pair"])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16], ids=("bf16", "fp16"))
-def test_late_max_rescale_and_clear_against_fp64(monkeypatch, dtype, route, spike):
+@pytest.mark.parametrize("dims", BUCKETS, ids=BUCKET_IDS)
+def test_late_max_rescale_and_clear_against_fp64(monkeypatch, dtype, route, spike, dims):
     ops = _ops()
-    x = _late_max_inputs(dtype, route, spike)
+    x = _late_max_inputs(dtype, route, spike, dim=dims[0], value_dim=dims[1])
     crossed, cleared = _rescale_profile(x, 1.0)
     # the inputs are directed as claimed, independently of the kernel
     assert crossed > 0 and (cleared > 0) == spike, (crossed, cleared)

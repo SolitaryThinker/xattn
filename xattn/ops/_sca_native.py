@@ -39,6 +39,7 @@ import torch
 from torch import Tensor
 
 from ._attention_core import _run_coordinates
+from . import _native_dispatch
 from ._native_dispatch import record_native_leaf
 from ._segment_metadata import resolve_segment_indices, validate_segment_indices
 
@@ -102,6 +103,12 @@ def launch_counts():
     return tuple(ops._flash_sca_native_launch_counts())
 
 
+# Rows up to this many keys take the mask-side metadata route (the extension's per-chunk segment
+# table is sized by the row length); above it the cumsum and the ids route below are used. Both
+# routes compute the same integers, so the switch changes the cost only.
+_MASK_MAX_KEYS = 131072
+
+
 @dataclass(frozen=True)
 class Visibility:
     q_segment_idx: Optional[Tensor] = None
@@ -109,6 +116,11 @@ class Visibility:
     segment_exact: Optional[Tensor] = None
     row_lo: Optional[Tensor] = None
     row_hi: Optional[Tensor] = None
+    # The BOS mask itself, when the extension can derive the bounds from it in the call that
+    # needs them (one metadata launch, no cumsum and no ids plane): the metadata boundary then
+    # costs one Python->C++ call instead of a chain of launches. Rows above kMaskMaxKeys keep
+    # the ids route below, which computes the same integers.
+    bos_mask: Optional[Tensor] = None
 
 
 def _validate_bos(bos_mask: Tensor, q: Tensor, total: int) -> None:
@@ -192,6 +204,11 @@ def visibility(q: Tensor, total: int, chunk_size: int, *, q_segment_idx=None,
         if any(x is not None for x in (segment_idx, q_segment_idx, k_segment_idx)):
             raise ValueError("BOS masks and segment indices are mutually exclusive")
         _validate_bos(bos_mask, q, total)
+        if not reset and total <= _MASK_MAX_KEYS:
+            # The bounds come from the mask inside the forward/backward call itself, so the
+            # metadata boundary is one Python->C++ call and one launch, with no cumsum, no
+            # ids plane and no bool->int64 cast to build (Visibility.bos_mask).
+            return Visibility(bos_mask=bos_mask.contiguous())
         k_ids = bos_mask.cumsum(dim=1, dtype=torch.int64)
         q_ids = k_ids[:, total - length:]
         sorted_ids = True
@@ -210,6 +227,16 @@ def visibility(q: Tensor, total: int, chunk_size: int, *, q_segment_idx=None,
     q_ids = q_ids.contiguous()
     k_ids = k_ids.contiguous()
     device = q.device
+    if sorted_ids and not reset:
+        # One native launch for exactly the sorted branch below (xattn_cuda's
+        # _flash_sca_native_row_bounds): the ids are nondecreasing per row by construction
+        # (a BOS mask's cumsum), and every value is an integer, so this route and the Python
+        # chain agree bit for bit. A build without the op keeps the chain below. Reached only
+        # above _MASK_MAX_KEYS: shorter rows take the mask route further up.
+        op = getattr(_extension_ops(), "_flash_sca_native_row_bounds", None)
+        if op is not None:
+            lo32, hi32 = op(k_ids, int(length), int(total), int(chunk_size), bool(strict))
+            return Visibility(row_lo=lo32, row_hi=hi32)
     rows = torch.arange(length, device=device, dtype=torch.int64)[None, :]
 
     if reset:
@@ -298,6 +325,7 @@ def _forward(q, k, v, prev_k, prev_v, chunk_size, scale, meta, strict, level):
         q, k, v, prev_k, prev_v, chunk_size, scale,
         meta.q_segment_idx, meta.k_segment_idx, meta.segment_exact,
         meta.row_lo, meta.row_hi, bool(strict), level >= 1, None,
+        bos_mask=meta.bos_mask,
     )
 
 
@@ -308,6 +336,7 @@ def _backward(dy, q, k, v, prev_k, prev_v, y, lse, chunk_size, scale, meta, stri
         dy, q, k, v, prev_k, prev_v, y, lse, chunk_size, scale,
         meta.q_segment_idx, meta.k_segment_idx, meta.segment_exact,
         meta.row_lo, meta.row_hi, bool(strict), bool(deterministic), bool(fp32_kv_grads),
+        bos_mask=meta.bos_mask,
     )
 
 
@@ -350,11 +379,146 @@ def flash_sca(q, k, v, chunk_size, scale, prev_k, prev_v, q_segment_idx, k_segme
                                  deterministic)
 
 
+def _mask_forward_route(q, k, v, prev_k, prev_v, chunk_size, bos_mask, q_segment_idx,
+                        k_segment_idx, segment_idx, reset_chunk_pos_per_seq, attn_method,
+                        high_precision_level) -> bool:
+    """Whether a forward call is unambiguously the BOS-mask level-0 training route.
+
+    Pure Python reads of the arguments: no tensor operation, no allocation, no
+    synchronisation. Every operand test ``_validate`` and the routes below make is
+    re-checked here, so a call this admits is one the full path would have run to
+    completion, and a call it refuses (an error, another route, another level) takes
+    the full path and main's own answer or error.
+    """
+    if (bos_mask is None or high_precision_level != 0 or reset_chunk_pos_per_seq
+            or q_segment_idx is not None or k_segment_idx is not None
+            or segment_idx is not None or attn_method != "default"):
+        return False
+    if type(chunk_size) is not int or chunk_size <= 0:
+        return False
+    if (bos_mask.dtype is not torch.bool or bos_mask.dim() != 2
+            or bos_mask.device != q.device or not bos_mask.is_contiguous()):
+        return False
+    if (q.dim() != 4 or k.dim() != 4 or v.dim() != 4
+            or q.device != k.device or q.device != v.device
+            or q.dtype != k.dtype or q.dtype != v.dtype
+            or (q.dtype is not torch.float16 and q.dtype is not torch.bfloat16)):
+        return False
+    if (q.shape[0] != k.shape[0] or k.shape[:2] != v.shape[:2]
+            or not 0 < q.shape[1] <= k.shape[1]):
+        return False
+    heads_q, heads_kv = q.shape[2], k.shape[2]
+    if (heads_kv != v.shape[2] or heads_q <= 0 or heads_kv <= 0
+            or heads_q % heads_kv != 0 or q.shape[3] != k.shape[3]):
+        return False
+    dim, width = q.shape[3], v.shape[3]
+    if not (0 < dim <= 256 and 0 < width <= 256 and dim % 8 == 0 and width % 8 == 0):
+        return False
+    total = k.shape[1]
+    if prev_k is not None or prev_v is not None:
+        if prev_k is None or prev_v is None:
+            return False
+        total += prev_k.shape[1]
+        if (prev_k.dim() != 4 or prev_v.dim() != 4
+                or prev_k.device != q.device or prev_v.device != q.device
+                or prev_k.dtype != q.dtype or prev_v.dtype != q.dtype
+                or prev_k.shape[0] != q.shape[0] or prev_v.shape[0] != q.shape[0]
+                or prev_k.shape[1] != chunk_size or prev_v.shape[1] != chunk_size
+                or prev_k.shape[2:] != k.shape[2:] or prev_v.shape[2:] != v.shape[2:]):
+            return False
+    return (bos_mask.shape[0] == q.shape[0] and bos_mask.shape[1] == total
+            and total <= _MASK_MAX_KEYS)
+
+
+# The BOS-mask level-0 training route, memoised on the call's metadata. The key -
+# every value the public entry (flash_sca_fwd in sliding_chunk_attention.py: the precision-level,
+# scale and dimension checks, the non-positive-scale branch, `selected`) and _mask_forward_route
+# read: the operands' exact type, sizes, dtypes and devices, the mask's contiguity, the absence
+# of segment arguments, and the scalar arguments with their exact types - is built and checked by
+# the extension inside the one pybind crossing (host.cc, ForwardFast). A key is learned only by
+# a call the full path ran to the mask route's extension call (flash_sca_fwd below), so a hit is
+# a call the full path would run there again; a miss returns None and takes the full path.
+# Nothing that depends on tensor contents or data pointers is decided by the key: the extension
+# validates, allocates and prepares every call. Bounded (64 keys, cleared whole when full).
+_FAST_OPS = None
+
+
+def _fast_ops():
+    """The extension's ops when it has the repeat-call route, else None."""
+    global _FAST_OPS
+    if _FAST_OPS is None:
+        ops = _extension_ops()
+        if ops is not None and hasattr(ops, "_flash_sca_native_fwd_fast"):
+            _FAST_OPS = ops
+    return _FAST_OPS
+
+
+def mask_forward_fast(q, k, v, chunk_size, scale, prev_k, prev_v, q_segment_idx, k_segment_idx,
+                      segment_idx, bos_mask, backend, reset_chunk_pos_per_seq, attn_method,
+                      high_precision_level):
+    """``(y, lse)`` of a memoised call, or None (the caller takes the full path).
+
+    The route records are the full path's: ``record_route("native")`` and the native-leaf
+    record, before the extension call can fail. With route tracing off both record nothing, so
+    the key test and the call are one crossing; with it on, the hit test comes first."""
+    ops = _FAST_OPS or _fast_ops()
+    if ops is None:
+        return None
+    if not _native_dispatch._TRACE_ENABLED:
+        return ops._flash_sca_native_fwd_fast(
+            q, k, v, chunk_size, scale, prev_k, prev_v, q_segment_idx, k_segment_idx,
+            segment_idx, bos_mask, backend, reset_chunk_pos_per_seq, attn_method,
+            high_precision_level)
+    if not ops._flash_sca_native_fwd_fast_hit(
+            q, k, v, chunk_size, scale, prev_k, prev_v, q_segment_idx, k_segment_idx,
+            segment_idx, bos_mask, backend, reset_chunk_pos_per_seq, attn_method,
+            high_precision_level):
+        return None
+    _native_dispatch.record_route("native")
+    record_native_leaf("sca_fwd", q, 0)
+    with torch.no_grad():
+        return ops._flash_sca_native_fwd_mask(
+            q, k, v, prev_k, prev_v, chunk_size, _scale(q, scale), bos_mask)
+
+
+def fast_keys_clear():
+    """Forget every learned repeat-call key (tests)."""
+    ops = _fast_ops()
+    if ops is not None:
+        ops._flash_sca_native_fwd_fast_clear()
+
+
+def fast_keys_size():
+    """How many repeat-call keys are learned (tests)."""
+    ops = _fast_ops()
+    return 0 if ops is None else ops._flash_sca_native_fwd_fast_size()
+
+
 @torch.no_grad()
 def flash_sca_fwd(q, k, v, chunk_size, scale, prev_k, prev_v, q_segment_idx, k_segment_idx, *,
                   segment_idx, bos_mask, reset_chunk_pos_per_seq, attn_method,
-                  high_precision_level):
-    """Standalone forward: ``(y, lse)``; level 1 runs the high-precision softmax."""
+                  high_precision_level, fast_backend=None):
+    """Standalone forward: ``(y, lse)``; level 1 runs the high-precision softmax.
+
+    ``fast_backend`` is the public entry's ``backend`` argument when it passed its checks for
+    this call (mask_forward_fast's key needs it); the call's key is learned once it takes the
+    mask route."""
+    if _mask_forward_route(q, k, v, prev_k, prev_v, chunk_size, bos_mask, q_segment_idx,
+                           k_segment_idx, segment_idx, reset_chunk_pos_per_seq, attn_method,
+                           high_precision_level):
+        if fast_backend is not None:
+            ops = _fast_ops()
+            if ops is not None:
+                ops._flash_sca_native_fwd_fast_learn(
+                    q, k, v, chunk_size, scale, prev_k, prev_v, q_segment_idx, k_segment_idx,
+                    segment_idx, bos_mask, fast_backend, reset_chunk_pos_per_seq, attn_method,
+                    high_precision_level)
+        # The mask route's metadata boundary is the mask itself: the extension derives the row
+        # bounds from it inside the call, so this is the one Python->C++ crossing of the call.
+        # The native-leaf record is the one _forward makes, before the entry can fail.
+        record_native_leaf("sca_fwd", q, 0)
+        return _extension_ops()._flash_sca_native_fwd_mask(
+            q, k, v, prev_k, prev_v, chunk_size, _scale(q, scale), bos_mask)
     total = _validate(q, k, v, prev_k, prev_v, chunk_size, attn_method, "flash_sca_fwd")
     meta = visibility(q, total, chunk_size, q_segment_idx=q_segment_idx,
                       k_segment_idx=k_segment_idx, segment_idx=segment_idx,

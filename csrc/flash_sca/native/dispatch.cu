@@ -6,6 +6,7 @@
 #include <cuda_fp16.h>
 
 #include "flash_sca/native/backward_stage_mask.h"
+#include "flash_sca/native/row_bounds.h"
 #include "flash_sca/native/umma_tile_mask.cuh"
 #include "flash_sca/native/visibility.cuh"
 
@@ -71,7 +72,51 @@ __global__ void KeyTileRangeKernel(const Params p) {
 
 }  // namespace detail
 
-void LaunchTileBounds(Params& p, cudaStream_t stream) {
+// The metadata boundary's fused visible-bounds reduction (row_bounds.h): one thread per query
+// row, a binary search per row over the key ids. It replaces the Python chain's cumsum-side
+// searchsorted/maximum/minimum/cast launches with this one launch; the ids themselves are
+// still the caller's (the BOS mask's cumsum), so the two routes cannot disagree on them.
+__global__ void RowBoundsKernel(const RowBoundsArgs a) {
+  const int64_t i = int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
+  const int64_t b = blockIdx.y;
+  if (i >= a.q_length) return;
+  const int64_t* const row = a.ids + b * a.total;
+  const int64_t p = i + (a.total - a.q_length);
+  const int64_t id = row[p];
+  // lower_bound(row, id): first index whose id is >= id. torch.searchsorted(..., right=False).
+  int64_t low = 0, high = a.total;
+  while (low < high) {
+    const int64_t mid = low + (high - low) / 2;
+    if (row[mid] < id) {
+      low = mid + 1;
+    } else {
+      high = mid;
+    }
+  }
+  const int64_t first = low;
+  // upper_bound(row, id): first index whose id is > id. searchsorted(..., right=True) - 1 is
+  // the last key of the query's own segment run.
+  low = 0;
+  high = a.total;
+  while (low < high) {
+    const int64_t mid = low + (high - low) / 2;
+    if (row[mid] <= id) {
+      low = mid + 1;
+    } else {
+      high = mid;
+    }
+  }
+  const int64_t last = low - 1;
+  int64_t lo = (p / a.chunk - 1) * a.chunk;  // p >= 0, chunk > 0: floor division
+  if (lo < 0) lo = 0;
+  int64_t hi = p - a.strict;
+  if (first > lo) lo = first;
+  if (last < hi) hi = last;
+  a.row_lo[b * a.q_length + i] = static_cast<int32_t>(lo);
+  a.row_hi[b * a.q_length + i] = static_cast<int32_t>(hi);
+}
+
+void LaunchTileBounds(const Params& p, cudaStream_t stream) {
   const dim3 grid(static_cast<unsigned>(p.tile_count), static_cast<unsigned>(p.batch));
   detail::TileBoundsKernel<<<grid, detail::kTileRows, 0, stream>>>(p);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
@@ -80,6 +125,152 @@ void LaunchTileBounds(Params& p, cudaStream_t stream) {
 void LaunchKeyTileRange(Params& p, cudaStream_t stream) {
   const dim3 grid(static_cast<unsigned>(p.key_tile_count), static_cast<unsigned>(p.batch));
   detail::KeyTileRangeKernel<<<grid, 256, 0, stream>>>(p);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+void LaunchRowBounds(const RowBoundsArgs& args, cudaStream_t stream) {
+  constexpr unsigned kThreads = 256;
+  const dim3 grid(static_cast<unsigned>((args.q_length + kThreads - 1) / kThreads),
+                  static_cast<unsigned>(args.batch));
+  RowBoundsKernel<<<grid, kThreads, 0, stream>>>(args);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+namespace {
+
+// Key positions per entry of the mask kernel's start table: one 32-bit word of the mask, so a
+// start's chunk is its position >> 5 and phase 2 answers from shared memory alone.
+constexpr int64_t kMaskChunk = 32;
+
+}  // namespace
+
+// The mask-side bounds of the metadata boundary (row_bounds.h): the BOS mask in, the row bounds
+// out, with no cumsum and no ids plane built at all. Phase 1 reads the row once per CTA in
+// 16-byte vector loads and ORs each set position into its chunk's 32-bit word (an OR of the same
+// bits from any order is the same table, so the atomics are order-free and two identical calls
+// cannot differ); phase 2 then answers each query out of shared memory - the highest start at or
+// before p and the lowest start after it, walking the chunk-occupancy words outward instead of
+// rescanning the mask.
+__global__ void RowBoundsMaskKernel(const RowBoundsMaskArgs a) {
+  extern __shared__ int32_t smem[];
+  const int64_t nchunk = (a.total + kMaskChunk - 1) / kMaskChunk;
+  const int64_t nwords = (nchunk + 31) / 32;
+  uint32_t* const starts = reinterpret_cast<uint32_t*>(smem);              // [nchunk]
+  uint32_t* const occupied = reinterpret_cast<uint32_t*>(smem + nchunk);   // [nwords]
+  const int64_t b = blockIdx.y;
+  const uint8_t* const row = a.mask + b * a.total;
+  for (int64_t c = threadIdx.x; c < nchunk; c += blockDim.x) starts[c] = 0u;
+  for (int64_t w = threadIdx.x; w < nwords; w += blockDim.x) occupied[w] = 0u;
+  __syncthreads();
+  // Phase 1: the row's start bits. The head is scalar because the row pointer need not be
+  // 16-byte aligned, and only a 16-byte group that holds a start is looked at byte by byte.
+  {
+    const int64_t head =
+        static_cast<int64_t>((16u - (reinterpret_cast<uintptr_t>(row) & 15u)) & 15u);
+    const int64_t head_end = head < a.total ? head : a.total;
+    for (int64_t x = threadIdx.x; x < head_end; x += blockDim.x) {
+      if (row[x] != 0) {
+        const int64_t c = x >> 5;
+        atomicOr(&starts[c], uint32_t(1) << (static_cast<unsigned>(x) & 31u));
+        atomicOr(&occupied[c >> 5], uint32_t(1) << (static_cast<unsigned>(c) & 31u));
+      }
+    }
+    const int64_t groups = (a.total - head_end) / 16;
+    const uint4* const vec = reinterpret_cast<const uint4*>(row + head_end);
+    for (int64_t g = threadIdx.x; g < groups; g += blockDim.x) {
+      const uint4 v = vec[g];
+      if (v.x == 0u && v.y == 0u && v.z == 0u && v.w == 0u) continue;
+      const int64_t x = head_end + 16 * g;
+#pragma unroll
+      for (int k = 0; k < 16; ++k) {
+        if (row[x + k] == 0) continue;
+        const int64_t y = x + k;
+        const int64_t c = y >> 5;
+        atomicOr(&starts[c], uint32_t(1) << (static_cast<unsigned>(y) & 31u));
+        atomicOr(&occupied[c >> 5], uint32_t(1) << (static_cast<unsigned>(c) & 31u));
+      }
+    }
+    for (int64_t x = head_end + 16 * groups + threadIdx.x; x < a.total; x += blockDim.x) {
+      if (row[x] != 0) {
+        const int64_t c = x >> 5;
+        atomicOr(&starts[c], uint32_t(1) << (static_cast<unsigned>(x) & 31u));
+        atomicOr(&occupied[c >> 5], uint32_t(1) << (static_cast<unsigned>(c) & 31u));
+      }
+    }
+  }
+  __syncthreads();
+  const int64_t i = int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (i >= a.q_length) return;
+  const int64_t p = i + (a.total - a.q_length);
+  const int64_t c = p >> 5;
+  const unsigned bit = static_cast<unsigned>(p) & 31u;
+  // first: the last start at or before p (0 when the row has no start at all), which is the
+  // ids route's lower_bound(row, row[p]) over the cumsum.
+  int64_t first = 0;
+  {
+    const uint32_t m =
+        starts[c] & (bit == 31u ? 0xffffffffu : ((uint32_t(1) << (bit + 1u)) - 1u));
+    if (m != 0u) {
+      first = (c << 5) + (31 - __clz(m));
+    } else if (c > 0) {
+      int64_t w = (c - 1) >> 5;  // the highest occupied chunk below c
+      uint32_t keep = (c & 31) != 0 ? (uint32_t(1) << (static_cast<unsigned>(c) & 31u)) - 1u
+                                    : 0xffffffffu;
+      while (true) {
+        const uint32_t mw = occupied[w] & keep;
+        if (mw != 0u) {
+          const int64_t k = (w << 5) + (31 - __clz(mw));
+          first = (k << 5) + (31 - __clz(starts[k]));
+          break;
+        }
+        if (w == 0) break;
+        --w;
+        keep = 0xffffffffu;
+      }
+    }
+  }
+  // last: the next start after p, minus one (total - 1 when the row has no start after p), which
+  // is the ids route's upper_bound(row, row[p]) - 1.
+  int64_t last = a.total - 1;
+  {
+    const uint32_t m = bit == 31u ? 0u : (starts[c] & (0xffffffffu << (bit + 1u)));
+    if (m != 0u) {
+      last = (c << 5) + (__ffs(m) - 1) - 1;
+    } else if (c + 1 < nchunk) {
+      int64_t w = (c + 1) >> 5;  // the lowest occupied chunk above c
+      uint32_t keep = ((c + 1) & 31) != 0
+                          ? 0xffffffffu << (static_cast<unsigned>(c + 1) & 31u)
+                          : 0xffffffffu;
+      while (true) {
+        const uint32_t mw = (w < nwords ? occupied[w] : 0u) & keep;
+        if (mw != 0u) {
+          const int64_t k = (w << 5) + (__ffs(mw) - 1);
+          last = (k << 5) + (__ffs(starts[k]) - 1) - 1;
+          break;
+        }
+        ++w;
+        if (w >= nwords) break;
+        keep = 0xffffffffu;
+      }
+    }
+  }
+  int64_t lo = (p / a.chunk - 1) * a.chunk;  // p >= 0, chunk > 0: floor division
+  if (lo < 0) lo = 0;
+  int64_t hi = p - a.strict;
+  if (first > lo) lo = first;
+  if (last < hi) hi = last;
+  a.row_lo[b * a.q_length + i] = static_cast<int32_t>(lo);
+  a.row_hi[b * a.q_length + i] = static_cast<int32_t>(hi);
+}
+
+void LaunchRowBoundsMask(const RowBoundsMaskArgs& args, cudaStream_t stream) {
+  constexpr unsigned kThreads = 256;
+  const int64_t nchunk = (args.total + kMaskChunk - 1) / kMaskChunk;
+  const int64_t nwords = (nchunk + 31) / 32;
+  const size_t bytes = static_cast<size_t>(nchunk + nwords) * sizeof(int32_t);
+  const dim3 grid(static_cast<unsigned>((args.q_length + kThreads - 1) / kThreads),
+                  static_cast<unsigned>(args.batch));
+  RowBoundsMaskKernel<<<grid, kThreads, bytes, stream>>>(args);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 

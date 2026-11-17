@@ -625,7 +625,9 @@ __global__ void __launch_bounds__(kThreads) ForwardKernel(
 // 2 = refused before the launch call, with nothing enqueued. A launch call that reports an error
 // is none of these: TryLaunchPipe raises it, so it never reaches the fallback below.
 namespace fwdpipe {
-template <class E>
+// One explicit instantiation per (element, D bucket, Dv bucket), in
+// instantiations/sca_umma_fwd_pipe_d<D>_v<Dv>.cu.
+template <class E, int kD, int kDv>
 int TryLaunchPipe(const UmmaLaunchParams& lp, cudaStream_t stream);
 }  // namespace fwdpipe
 
@@ -698,17 +700,22 @@ bool LaunchUmmaForward(const UmmaLaunchParams& params, cudaStream_t stream) {
     (void)cudaGetLastError();
     return false;
   }
-  // At the two buckets that have an instantiation of the pipelined body (umma_fwd_pipe.cuh) -
-  // (256,256) and (128,128) - that body takes every call host.cc resolved to it
-  // (fwdpipe::ForwardBody::kPipe), and its launch or its pre-launch refusal is this launcher's
-  // result: a refusal (2) returns false here, so the caller's refusal row and generic fallback
-  // apply to a call that enqueued nothing. A post-attempt launch error never arrives here as 2;
-  // TryLaunchPipe raises it. Every other call - a kLeaf call in these two buckets, every other
-  // bucket - reaches ForwardKernel below unchanged.
-  if constexpr ((kD == 256 && kDv == 256) || (kD == 128 && kDv == 128)) {
-    const int pipe = fwdpipe::TryLaunchPipe<E>(params, stream);
+  // Every (D, Dv) bucket pair has an instantiation of the pipelined body (umma_fwd_pipe.cuh). It
+  // takes every call host.cc resolved to it (fwdpipe::ForwardBody::kPipe), and its launch or its
+  // pre-launch refusal is this launcher's result: a refusal (2) returns false here, so the
+  // caller's refusal row and generic fallback apply to a call that enqueued nothing. A
+  // post-attempt launch error never arrives here as 2; TryLaunchPipe raises it. A kLeaf call
+  // reaches ForwardKernel below unchanged.
+  {
+    const int pipe = fwdpipe::TryLaunchPipe<E, kD, kDv>(params, stream);
     if (pipe == 1) return true;
-    if (pipe == 2) return false;
+    if (pipe == 2) {
+      // A refusal before the launch (nothing enqueued) falls back to the generic body, which
+      // walks key tiles through Params::tile_bounds. host.cc allocates that table for every
+      // call but fills it only for the bodies that read it, so fill it here for the fallback.
+      LaunchTileBounds(params.params, stream);
+      return false;
+    }
   }
   const cudaError_t attr = cudaFuncSetAttribute(
       reinterpret_cast<const void*>(&ForwardKernel<E, kD, kDv>),
