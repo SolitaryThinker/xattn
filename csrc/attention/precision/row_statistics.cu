@@ -1,4 +1,5 @@
-#include "attention/precision/row_statistics_sm90.cuh"
+#include "attention/precision/row_statistics_sm90_launch.h"
+#include "attention/precision/row_statistics_native.cuh"
 #include "attention/precision/row_statistics.h"
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
@@ -38,24 +39,44 @@ std::tuple<torch::Tensor,torch::Tensor,torch::Tensor> RowStatistics(
  auto meta=torch::empty({6,q.size(0),q.size(2),q.size(1)},opts);
  if(!q.numel()) return {delta,logz,meta};
  auto stream=at::cuda::getCurrentCUDAStream(q.get_device());
+ // Two capability families have a row-statistics implementation, and the choice is
+ // made from the device, never from which object happened to link: a weak symbol
+ // says the object is present, not that the device can run it. Hopper (sm_9x)
+ // keeps the seed GMMA contraction, which lives in its own translation unit
+ // (row_statistics_sm90_launch.cu) because wgmma is legal only there. Blackwell
+ // sm_10.3 uses the portable native contraction below.
+ const auto* properties=at::cuda::getCurrentDeviceProperties();
+ const bool hopper=properties->major==9;
+ const bool native_blackwell=properties->major==10 && properties->minor==3;
+ // Other capabilities are not advertised by this dispatcher. In particular,
+ // selecting a cubin or linking the weak Hopper symbol is not device support.
+ TORCH_CHECK(hopper || native_blackwell,"row statistics supports compute capabilities 9.x and 10.3, got ",properties->major,".",properties->minor);
+ if(hopper) {
+  TORCH_CHECK(RowStatisticsSm90Launch,"this build has no Hopper row-statistics kernel: row_statistics_sm90_launch.cu is missing from its SM90 source list");
+  RowStatisticsSm90Launch(
+    q.data_ptr(),k.data_ptr(),v.data_ptr(),g.data_ptr(),left.data_ptr<int>(),right.data_ptr<int>(),
+    qs ? qs->data_ptr<int64_t>() : nullptr,ks ? ks->data_ptr<int64_t>() : nullptr,
+    exact ? exact->data_ptr<int>() : nullptr,delta.data_ptr<float>(),logz.data_ptr<float>(),
+    meta.data_ptr<float>(),int(q.size(1)),int(k.size(1)),int(q.size(2)),int(k.size(2)),
+    int(q.size(3)),int(v.size(3)),int(q.size(0)),float(scale),
+    q.scalar_type()==at::kHalf ? 0 : 1,stream);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();return {delta,logz,meta};
+ }
  AT_DISPATCH_REDUCED_FLOATING_TYPES(q.scalar_type(),"precision_row_statistics",[&]{
-  using E=std::conditional_t<std::is_same_v<scalar_t,c10::Half>,cutlass::half_t,cutlass::bfloat16_t>;
+  using N=std::conditional_t<std::is_same_v<scalar_t,c10::Half>,__half,__nv_bfloat16>;
   auto rectangular=[&](auto bucket,auto vbucket,auto tag){
     constexpr int D=decltype(bucket)::value,DV=decltype(vbucket)::value;
     constexpr bool segments=decltype(tag)::value;
-    // One K/V stage when it raises CTAs per SM (D+DV between 128 and 512);
-    // 64/64 and 256/256 keep the double-buffered ring.
-    constexpr int Stages=D+DV>128 && D+DV<512 ? 1 : 2;
-    // Two warpgroups share each K/V tile (128 query rows per CTA) when two such
-    // CTAs still fit per SM; each row's arithmetic is independent of Groups.
-    constexpr int Groups=sizeof(StatisticsShared<E,D,DV,Stages,2>)<=113*1024 ? 2 : 1;
-    auto kernel=RowStatisticsSm90<E,D,DV,segments,Stages,Groups>;
-    constexpr int smem=sizeof(StatisticsShared<E,D,DV,Stages,Groups>);
-    C10_CUDA_CHECK(cudaFuncSetAttribute(kernel,cudaFuncAttributeMaxDynamicSharedMemorySize,smem));
-    // 1-D grid; the kernel orders query blocks heaviest first.
-    const dim3 grid(unsigned(((q.size(1)+64*Groups-1)/(64*Groups))*q.size(0)*q.size(2)));
-    kernel<<<grid,128*Groups,smem,stream>>>(
-      reinterpret_cast<E*>(q.data_ptr()),reinterpret_cast<E*>(k.data_ptr()),reinterpret_cast<E*>(v.data_ptr()),reinterpret_cast<E*>(g.data_ptr()),left.data_ptr<int>(),right.data_ptr<int>(),qs ? qs->data_ptr<int64_t>() : nullptr,ks ? ks->data_ptr<int64_t>() : nullptr,exact ? exact->data_ptr<int>() : nullptr,delta.data_ptr<float>(),logz.data_ptr<float>(),meta.data_ptr<float>(),q.size(1),k.size(1),q.size(2),k.size(2),q.size(3),v.size(3),q.size(0),float(scale));
+    const cudaError_t status=native_statistics::Launch<N,D,DV,segments>(
+      reinterpret_cast<const N*>(q.data_ptr()),reinterpret_cast<const N*>(k.data_ptr()),
+      reinterpret_cast<const N*>(v.data_ptr()),reinterpret_cast<const N*>(g.data_ptr()),
+      left.data_ptr<int>(),right.data_ptr<int>(),
+      qs ? qs->data_ptr<int64_t>() : nullptr,ks ? ks->data_ptr<int64_t>() : nullptr,
+      exact ? exact->data_ptr<int>() : nullptr,delta.data_ptr<float>(),
+      logz.data_ptr<float>(),meta.data_ptr<float>(),int(q.size(1)),int(k.size(1)),
+      int(q.size(2)),int(k.size(2)),int(q.size(3)),int(v.size(3)),int(q.size(0)),
+      float(scale),stream);
+    TORCH_CHECK(status==cudaSuccess,"portable row statistics launch failed: ",cudaGetErrorString(status));
   };
   auto segments=[&](auto bucket,auto vbucket){if(qs)rectangular(bucket,vbucket,std::true_type{});else rectangular(bucket,vbucket,std::false_type{});};
   auto values=[&](auto bucket){int width=v.size(3);if(width<=64)segments(bucket,std::integral_constant<int,64>{});else if(width<=128)segments(bucket,std::integral_constant<int,128>{});else segments(bucket,std::integral_constant<int,256>{});};

@@ -84,8 +84,17 @@ building.
 By default, the build targets visible GPUs; with no visible GPU it targets SM80.
 Set `XATTN_TARGET_SM=90a` for a headless SM90 build, or
 `XATTN_TARGET_SM=80,86,89,90a` for all supported targets. SM90 builds on an SM90
-system include the SM90 kernels by default. SM100 and newer architectures
-are currently unsupported.
+system include the SM90 kernels by default.
+
+Blackwell (B300, compute capability 10.3) is selected explicitly with
+`XATTN_TARGET_SM=103a` (or `103`/`10.3`, or discovered from a visible B300 by
+`auto`) and requires a CUDA 12.9+ toolkit. A Blackwell build emits
+`-gencode arch=compute_103a,code=sm_103a`, never the Hopper sources, and adds
+only the native Blackwell sources registered in `SM103_NATIVE_READER_CSRCS`.
+It is a build target, not a support statement: until a native Blackwell reader
+is registered there, a 103a extension contains no SoftDelta reader kernels.
+`XATTN_TARGET_SM=all` still means the 80/86/89/90a family; sm_90a and sm_103a
+cannot share one extension, so a build naming both is refused.
 
 Set `MAX_JOBS` to limit concurrent compilation jobs and `XATTN_NVCC_THREADS`
 to set nvcc threads per job (default: 4).

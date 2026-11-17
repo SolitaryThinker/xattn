@@ -1,4 +1,8 @@
 #include "bindings.h"
+#include "attention/native_cuda/registration.h"
+#ifdef XATTN_HAS_NATIVE_SCA
+#include "flash_sca/native/registration.h"
+#endif
 
 #include "flash_sca/sliding_chunk_attention.h"
 #include "flash_swa/flash_swa.h"
@@ -14,7 +18,13 @@ PYBIND11_MODULE(xattn_cuda, m) {
   ops::DefineFlashSWAOps(m_ops);
   ops::DefineCausalFlashAttnOps(m_ops);
   ops::DefineSoftDeltaOps(m_ops);
-#ifdef XATTN_HAS_SM90
+#ifdef XATTN_HAS_NATIVE_READER
+  ops::DefineNativeAttentionOps(m_ops);
+#endif
+#ifdef XATTN_HAS_NATIVE_SCA
+  ops::DefineNativeFlashSCAOps(m_ops);
+#endif
+#if defined(XATTN_HAS_SM90) || defined(XATTN_HAS_NATIVE_PRECISION)
   ops::DefineAttentionPrecisionOps(m_ops);
 #endif
 }

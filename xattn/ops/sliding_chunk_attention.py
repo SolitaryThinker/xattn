@@ -19,6 +19,8 @@ from ._segment_metadata import (
     resolve_segment_indices as _resolve_segment_indices,
 )
 from ._varlen_metadata import validate_packed_qkv
+from ._native_dispatch import record_route, route_traced
+from . import _sca_native
 from ._sca_segment_alignment import (
     needs_matched_reset as _needs_matched_reset,
     matched_forward as _matched_reset_forward,
@@ -524,9 +526,12 @@ def _validate_prev_kv_heads(
     *,
     api_name: str,
 ) -> None:
-    if prev_k is None:
+    if prev_k is None and prev_v is None:
         return
-    assert prev_v is not None
+    if (prev_k is None) != (prev_v is None):
+        raise ValueError(
+            f"{api_name} prev_k and prev_v must be provided together"
+        )
     if prev_k.dim() != 4 or prev_v.dim() != 4:
         raise ValueError(f"{api_name} prev_k/prev_v must be batched 4D tensors")
     if prev_k.device != k.device or prev_v.device != v.device:
@@ -1153,6 +1158,13 @@ def _flash_sca_varlen(
         None,
         reset_chunk_pos_per_seq,
     )
+    if _sca_native.selected(q, backend, "_flash_sca_varlen"):
+        record_route("native")
+        return _sca_native.flash_sca_varlen(
+            q, k, v, chunk_size, scale, cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_k=cu_seqlens_k, position_offsets=position_offsets,
+            attn_method=attn_method, deterministic=deterministic,
+        )
     return _FlashSCAVarlenFunc.apply(
         q,
         k,
@@ -1400,6 +1412,37 @@ def _flash_sca(
         max_seqlen_k = None
         position_offsets = None
         is_varlen = False
+    if is_varlen and _sca_native.selected(q, backend, "flash_sca"):
+        # Batched rows flatten into one packed sequence axis; each varlen run
+        # keeps its own key interval (`_sca_native.varlen_visibility`).
+        if cu_seqlens_k.numel() != cu_seqlens_q.numel():
+            raise NotImplementedError(
+                "flash_sca native varlen needs one key run per query run; "
+                "row-aligned runs (cu_seqlens_k with a different run count) "
+                "are not implemented on the native Blackwell kernels, and "
+                "nothing else was run"
+            )
+        q_packed, k_combined, v_combined = _pack_batched_varlen_inputs(
+            q, k, v, prev_k, prev_v
+        )
+        effective_position_offsets = position_offsets
+        if (
+            q.shape[0] > 1
+            and position_offsets is None
+            and not reset_chunk_pos_per_seq
+        ):
+            effective_position_offsets = torch.remainder(
+                cu_seqlens_q[:-1], q.shape[1]
+            ).contiguous()
+        record_route("native")
+        y_packed = _sca_native.flash_sca_varlen(
+            q_packed, k_combined, v_combined, chunk_size, scale,
+            cu_seqlens_q=cu_seqlens_q, cu_seqlens_k=cu_seqlens_k,
+            position_offsets=effective_position_offsets,
+            attn_method=attn_method, deterministic=deterministic,
+            api_name="flash_sca",
+        )
+        return _restore_varlen_output(y_packed, q, v)
     if is_varlen:
         q_packed, k_combined, v_combined = _pack_batched_varlen_inputs(
             q, k, v, prev_k, prev_v
@@ -1549,6 +1592,7 @@ def _flash_sca_varlen_fwd(
     return _extension_ops()._flash_sca_sm90_varlen_fwd(*args, **output_options)
 
 
+@route_traced("_flash_sca_fwd", "forward")
 def _flash_sca_fwd(
     q: Tensor,
     k: Tensor,
@@ -1572,6 +1616,16 @@ def _flash_sca_fwd(
     output_state: Optional[Tensor] = None,
     high_precision: bool = False,
 ) -> Tuple[Tensor, Tensor]:
+    if _sca_native.selected(q, backend, "_flash_sca_fwd"):
+        # Capability 10.x: the native kernels (strict past, segments, varlen, reset).
+        record_route("native")
+        return _sca_native.private_fwd(
+            q, k, v, chunk_size, scale, prev_k, prev_v, q_segment_idx, k_segment_idx,
+            reset_chunk_pos_per_seq, attn_method=attn_method, cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_k=cu_seqlens_k, max_seqlen_q=max_seqlen_q, max_seqlen_k=max_seqlen_k,
+            position_offsets=position_offsets, strict_past=strict_past,
+            output_state=output_state, high_precision=high_precision,
+        )
     output_options = {"high_precision": True} if high_precision else {}
     _check_attn_method_supported(attn_method)
     is_varlen = _validate_metadata_representation(
@@ -1799,6 +1853,7 @@ def _flash_sca_varlen_bwd(
     )
 
 
+@route_traced("_flash_sca_bwd", "backward")
 def _flash_sca_bwd(
     y_grad: Tensor,
     q: Tensor,
@@ -1827,6 +1882,16 @@ def _flash_sca_bwd(
 ) -> Tuple[Tensor, Tensor, Tensor, Optional[Tensor], Optional[Tensor]]:
     """``fp32_kv_grads`` (grouped query heads, dense routes, not ``strict_past``):
     dK / dV and their previous-chunk parts come back as the FP32 accumulators."""
+    if _sca_native.selected(q, backend, "_flash_sca_bwd"):
+        # Capability 10.x: the native kernels, deterministic whatever `deterministic` says.
+        record_route("native")
+        return _sca_native.private_bwd(
+            y_grad, q, k, v, y, lse, chunk_size, scale, prev_k, prev_v, q_segment_idx,
+            k_segment_idx, deterministic, reset_chunk_pos_per_seq, attn_method=attn_method,
+            cu_seqlens_q=cu_seqlens_q, cu_seqlens_k=cu_seqlens_k, max_seqlen_q=max_seqlen_q,
+            max_seqlen_k=max_seqlen_k, position_offsets=position_offsets,
+            strict_past=strict_past, fp32_kv_grads=fp32_kv_grads,
+        )
     _check_attn_method_supported(attn_method)
     is_varlen = _validate_metadata_representation(
         q_segment_idx,
@@ -2297,6 +2362,7 @@ def _prepare_store_and_execute_inference_bos_plan(
     )
 
 
+@route_traced("flash_sca", "forward")
 def flash_sca(
     q: Tensor,
     k: Tensor,
@@ -2333,20 +2399,32 @@ def flash_sca(
     validate_attention_scale(scale)
     validate_sm90_dimensions(q, v, backend, api_name="flash_sca")
     if scale is not None and float(scale) <= 0:
+        record_route("nonpositive_scale")
         return _dispatch_nonpositive_scale(flash_sca, locals())
     if high_precision_level:
         from ._precision_backend import apply as precision_apply
+        record_route("high_precision")
         return precision_apply(q, k, v, visibility=2, chunk_size=chunk_size, prev_k=prev_k, prev_v=prev_v, reset_chunk_pos_per_seq=reset_chunk_pos_per_seq, attn_method=attn_method,
             scale=scale, q_segment_idx=q_segment_idx, k_segment_idx=k_segment_idx,
             segment_idx=segment_idx, bos_mask=bos_mask, backend=backend,
             deterministic=deterministic, high_precision_level=high_precision_level)
+    if _sca_native.selected(q, backend, "flash_sca"):
+        record_route("native")
+        return _sca_native.flash_sca(
+            q, k, v, chunk_size, scale, prev_k, prev_v, q_segment_idx,
+            k_segment_idx, segment_idx=segment_idx, bos_mask=bos_mask,
+            reset_chunk_pos_per_seq=reset_chunk_pos_per_seq,
+            attn_method=attn_method, deterministic=deterministic,
+        )
     if _needs_matched_reset(q, q_segment_idx, k_segment_idx,
                             reset_chunk_pos_per_seq, segment_idx, bos_mask):
+        record_route("matched_reset")
         return _matched_reset_forward(
             q, k, v, chunk_size, scale, prev_k, prev_v,
             q_segment_idx, k_segment_idx, backend, attn_method,
             0, deterministic, autograd=True,
         )
+    record_route("generic")
     return _flash_sca(
         q,
         k,
@@ -2366,6 +2444,7 @@ def flash_sca(
     )
 
 
+@route_traced("flash_sca_fwd", "forward")
 def flash_sca_fwd(
     q: Tensor,
     k: Tensor,
@@ -2394,9 +2473,19 @@ def flash_sca_fwd(
     validate_attention_scale(scale)
     validate_sm90_dimensions(q, v, backend, api_name="flash_sca_fwd")
     if scale is not None and float(scale) <= 0:
+        record_route("nonpositive_scale")
         return _dispatch_nonpositive_scale(flash_sca_fwd, locals())
+    if _sca_native.selected(q, backend, "flash_sca_fwd"):
+        record_route("native")
+        return _sca_native.flash_sca_fwd(
+            q, k, v, chunk_size, scale, prev_k, prev_v, q_segment_idx,
+            k_segment_idx, segment_idx=segment_idx, bos_mask=bos_mask,
+            reset_chunk_pos_per_seq=reset_chunk_pos_per_seq,
+            attn_method=attn_method, high_precision_level=high_precision_level,
+        )
     if _needs_matched_reset(q, q_segment_idx, k_segment_idx,
                             reset_chunk_pos_per_seq, segment_idx, bos_mask):
+        record_route("matched_reset")
         y, _, lse = _matched_reset_forward(
             q, k, v, chunk_size, scale, prev_k, prev_v,
             q_segment_idx, k_segment_idx, backend, attn_method,
@@ -2436,6 +2525,7 @@ def flash_sca_fwd(
                 reset_chunk_pos_per_seq,
             )
             if cached_result is not None:
+                record_route("generic")
                 return cached_result
             result = _prepare_store_and_execute_inference_bos_plan(
                 q,
@@ -2451,6 +2541,7 @@ def flash_sca_fwd(
                 attn_method,
             )
             if result is not None:
+                record_route("generic")
                 return result
         (
             q_segment_idx,
@@ -2473,6 +2564,7 @@ def flash_sca_fwd(
             for_backward=False,
             api_name="flash_sca_fwd",
         )
+        record_route("generic")
         return _flash_sca_fwd(
             q,
             k,
@@ -2505,6 +2597,7 @@ def flash_sca_fwd(
             q_length=q.shape[1],
             k_length=k_length,
         )
+    record_route("generic")
     return _flash_sca_fwd(
         q,
         k,
@@ -2522,6 +2615,7 @@ def flash_sca_fwd(
     )
 
 
+@route_traced("flash_sca_bwd", "backward")
 def flash_sca_bwd(
     y_grad: Tensor,
     q: Tensor,
@@ -2558,16 +2652,27 @@ def flash_sca_bwd(
         _check_attn_method_supported(attn_method)
         validate_attention_saved_state(y, lse, q, v)
         from ._precision_backend import backward as precision_backward
+        record_route("high_precision")
         return precision_backward(y_grad, q, k, v,
             visibility=2, span=chunk_size, scale=scale, prev_k=prev_k, prev_v=prev_v,
             q_segment_idx=q_segment_idx, k_segment_idx=k_segment_idx,
             segment_idx=segment_idx, bos_mask=bos_mask, reset=reset_chunk_pos_per_seq,
             deterministic=deterministic, backend=backend)
     if scale is not None and float(scale) <= 0:
+        record_route("nonpositive_scale")
         return _dispatch_nonpositive_scale(flash_sca_bwd, locals())
     resolved_scale = _resolve_scale(q, scale) if scale is None else scale
+    if _sca_native.selected(q, backend, "flash_sca_bwd"):
+        record_route("native")
+        return _sca_native.flash_sca_bwd(
+            y_grad, q, k, v, y, lse, chunk_size, scale, prev_k, prev_v,
+            q_segment_idx, k_segment_idx, segment_idx=segment_idx,
+            bos_mask=bos_mask, reset_chunk_pos_per_seq=reset_chunk_pos_per_seq,
+            attn_method=attn_method, deterministic=deterministic,
+        )
     if _needs_matched_reset(q, q_segment_idx, k_segment_idx,
                             reset_chunk_pos_per_seq, segment_idx, bos_mask):
+        record_route("matched_reset")
         return _matched_reset_backward(
             y_grad, q, k, v, y, lse, chunk_size, scale, prev_k, prev_v,
             q_segment_idx, k_segment_idx, backend, attn_method, deterministic,
@@ -2603,6 +2708,7 @@ def flash_sca_bwd(
             for_backward=True,
             api_name="flash_sca_bwd",
         )
+        record_route("generic")
         return _flash_sca_bwd(
             y_grad,
             q,
@@ -2638,6 +2744,7 @@ def flash_sca_bwd(
             q_length=q.shape[1],
             k_length=k_length,
         )
+    record_route("generic")
     return _flash_sca_bwd(
         y_grad,
         q,

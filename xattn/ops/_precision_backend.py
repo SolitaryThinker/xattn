@@ -1,6 +1,24 @@
-"""Precision-repair backward (high_precision_level=1) shared by the SM90 attention
-families. SoftDelta calls it for each read and combines the FP32 accumulators
-before the public cast.
+"""Precision-repair backward (high_precision_level=1) shared by the attention
+families, on SM90 and on native SM103. SoftDelta calls it for each read and
+combines the FP32 accumulators before the public cast.
+
+Backend selection is a capability decision, never a name alias: ``sm90`` is
+SM90-only, ``native`` demands a linked native implementation of the exact
+branch, and ``auto`` follows the device class -- the SM90 route on a major-9
+device, the native route on a device that has no SM90 route -- unless the
+caller names one.  It permits a route; it never picks a symbol: both
+implementations register the same ``_attention_precision_*`` op names and the
+linked build decides which body runs.  A missing component is reported as a
+missing component; nothing is silently replaced by another backend or by the
+level-0 backward.
+
+The native extension reports what it links in ``_native_attention_level_mask``;
+the precision-repair algorithm of level 1 is the native leaf's internal level 4
+(dual-operand P/dS, range protection, probability-mass repair), so its bit is
+``_NATIVE_REPAIR_BIT``.
+
+Every resolved call, and every refused one, leaves a record in `route_trace()`,
+so that a passing result cannot be mistaken for native execution.
 """
 import torch
 from ._segment_metadata import resolve_segment_indices, validate_segment_indices
@@ -12,28 +30,335 @@ from ._attention_core import resolve_scale
 ZERO_SUM_WINDOW = 64
 _PRESCALE_TARGET = 2.0 ** 13
 
+# Bit of `_native_attention_level_mask` that advertises the native leaf of the
+# precision-repair backward (see the module docstring).
+_NATIVE_REPAIR_BIT = 4
 
-def _ops():
-    import xattn_cuda
-    ops = xattn_cuda.ops
-    if not all(hasattr(ops, name) for name in (
-            '_attention_precision_main_backward',
-            '_attention_precision_zero_sum_repair',
-            '_attention_precision_ordered_backward',
-            '_attention_precision_key_runs',
-            '_attention_precision_enforce_constant_keys')):
-        raise RuntimeError('high_precision_level=1 requires rebuilding the xattn SM90 CUDA extension')
+# Ops every precision-repair branch needs.
+_PRECISION_COMMON_OPS = (
+    '_attention_precision_center',
+    '_attention_precision_row_statistics',
+    '_attention_precision_key_runs',
+    '_attention_precision_enforce_constant_keys',
+)
+
+# Ops the forward-side precheck of `apply` requires.
+_LEGACY_REQUIRED_OPS = (
+    '_attention_precision_main_backward',
+    '_attention_precision_zero_sum_repair',
+    '_attention_precision_ordered_backward',
+    '_attention_precision_key_runs',
+    '_attention_precision_enforce_constant_keys',
+)
+
+_BACKEND_NAMES = ('', 'auto', 'native', 'sm90')
+
+# What the last capability read saw, for the route record below.
+_LAST_MASK = 0
+_LAST_CAPABILITY = (0, 0)
+_LAST_PROBE_ERROR = None
+
+# One route record per call, resolved or refused: what was asked for, what was
+# resolved, and on what mask.  The same record is offered to the Python
+# dispatcher's trace when that module provides a sink; a sink that fails never
+# makes the op fail.
+_ROUTE_TRACE = []
+_ROUTE_TRACE_MAX = 64
+
+
+def route_trace():
+    """The route records this module made, oldest first."""
+    return [dict(record) for record in _ROUTE_TRACE]
+
+
+def _route_sink():
+    try:
+        from . import _native_dispatch
+    except Exception:  # the dispatcher module is a separate proposal
+        return None
+    return getattr(_native_dispatch, 'record_route', None)
+
+
+def _record_route(record):
+    _ROUTE_TRACE.append(dict(record))
+    del _ROUTE_TRACE[:-_ROUTE_TRACE_MAX]
+    sink = _route_sink()
+    if sink is not None:
+        try:
+            sink(dict(record))
+        except Exception:  # noqa: BLE001 - a trace sink must not break the op
+            pass
+
+
+def _resolve_call_backend(backend, q, level, deterministic, visibility):
+    """Resolve the backend for one call and record what was decided.
+
+    The capability, mask and probe error go into the record straight from this
+    call's own `info` dict, not from the module globals: two backward calls on
+    different threads would otherwise be able to attribute one call's mask or
+    probe failure to the other.  The globals stay for debugging only.
+    """
+    record = {'call': 'advanced-precision-backward', 'requested': backend,
+              'level': level, 'deterministic': bool(deterministic),
+              'visibility': visibility, 'device': str(q.device)}
+    info = {}
+    try:
+        resolved = _resolve_backend(backend, q, level, deterministic, visibility, info)
+    except Exception as exc:
+        record.update(resolved=None, capability=list(info.get('capability') or (0, 0)),
+                      native_mask=info.get('native_mask', 0),
+                      probe_error=info.get('probe_error'),
+                      refused='%s: %s' % (type(exc).__name__, exc))
+        _record_route(record)
+        raise
+    record.update(resolved=resolved, capability=list(info.get('capability') or (0, 0)),
+                  native_mask=info.get('native_mask', 0),
+                  probe_error=info.get('probe_error'), refused=None)
+    _record_route(record)
+    return resolved
+
+
+def required_precision_ops(deterministic=False):
+    """The exact op set that the (deterministic) branch of `backward` calls.
+
+    A symbol that the branch never executes must not be required, and a symbol
+    the branch does execute must be. Keep this in step with `backward`: the
+    deterministic branch replaces the main backward and the probability repair
+    by the ordered backward and the deterministic repair, while the row scaling,
+    the zero-sum repair and the fallback dV apply to both.
+    """
+    names = list(_PRECISION_COMMON_OPS)
+    names.append('_attention_precision_ordered_backward' if deterministic
+                 else '_attention_precision_main_backward')
+    names.append('_attention_precision_zero_sum_repair')
+    names.append('_attention_precision_deterministic_repair' if deterministic
+                 else '_attention_precision_probability_repair')
+    names.append('_attention_precision_scale_do')
+    names.append('_attention_precision_fallback_dv')
+    return tuple(names)
+
+
+# Why the extension or its capability probe last failed, for the error text.
+_EXTENSION_ERROR = None
+_PROBE_ERROR = None
+
+
+def _extension():
+    """The linked extension's ops module, or None when it is not usable.
+
+    Any exception counts: a missing module is ImportError, a present module
+    whose shared libraries do not load is OSError, and a build against another
+    CUDA/ABI raises RuntimeError.  All of them mean "no implementation".
+    """
+    global _EXTENSION_ERROR
+    try:
+        import xattn_cuda
+    except Exception as exc:  # noqa: BLE001 - every failure means the same thing
+        _EXTENSION_ERROR = '%s: %s' % (type(exc).__name__, exc)
+        return None
+    ops = getattr(xattn_cuda, 'ops', None)
+    if ops is None:
+        _EXTENSION_ERROR = 'the imported xattn_cuda module has no .ops submodule'
+        return None
+    _EXTENSION_ERROR = None
     return ops
+
+
+def _ops(level=None, deterministic=False, device=None):
+    ops = _extension()
+    if ops is None:
+        raise RuntimeError(
+            'high_precision_level=1 requires the compiled xattn CUDA extension and importing it '
+            'failed (%s)%s; nothing was run and no fallback was substituted'
+            % (_EXTENSION_ERROR, '' if device is None else ' on device %s' % (device,)))
+    names = _LEGACY_REQUIRED_OPS if level is None else required_precision_ops(deterministic)
+    missing = [name for name in names if not hasattr(ops, name)]
+    if missing:
+        raise RuntimeError(
+            'high_precision_level=1 requires an xattn CUDA extension whose ops module provides '
+            + ', '.join(missing)
+            + '; the linked build lacks ' + ('it' if len(missing) == 1 else 'them')
+            + ('' if level is None else ', so level %d%s cannot run' % (
+                level, ' (deterministic)' if deterministic else ''))
+            + ('' if device is None else ' on device %s' % (device,))
+            + '. No SM90-named alias or lower precision level is substituted.')
+    return ops
+
+
+def _check_backend_name(backend):
+    """Normalize the backend name the way the public API does, or refuse it.
+
+    `_normalize_backend` in `softdelta_attention` strips, lowercases and folds
+    '-' to '_', and maps '' to 'auto'; this applies the same spelling rule and
+    adds 'native' to the accepted set, so a name that the public API accepts is
+    spelled the same way here.  The only policy sentence added is about
+    'torch': it is the public API's reference route, not a precision backward.
+    """
+    if not isinstance(backend, str):
+        raise TypeError('advanced precision backend must be a string')
+    name = backend.strip().lower().replace('-', '_')
+    if name not in _BACKEND_NAMES:
+        raise ValueError(
+            "advanced precision backend must be '', 'auto', 'native' or 'sm90' (got %r)%s"
+            % (backend, "; 'torch' is the reference route of the public API and is not an "
+                        'advanced-precision backward backend' if name == 'torch' else ''))
+    return 'auto' if name == '' else name
+
+
+def _native_level_mask(q):
+    """Per-bit availability of the native implementation on q's device.
+
+    Bit k set means, on THIS device and THIS build: for k in (0, 1) the basic
+    reader level k is linked forward and backward (the Python dispatcher's
+    promise), and for k in (2, 3, 4) the advanced-precision level k is linked
+    with the exact op set `required_precision_ops(k, deterministic)`.  The mask
+    must be device-derived, never a build-time constant, or a Hopper device
+    would be told it has native levels it cannot run.  Three different absences
+    all give 0 and only one of them is `_PROBE_ERROR`: no probe symbol on the
+    extension gives 0 with no reason, an extension that cannot be imported
+    gives 0 with its reason in `_EXTENSION_ERROR`, and a probe that raises
+    gives 0 with its reason in `_PROBE_ERROR`.
+    """
+    global _PROBE_ERROR
+    ops = _extension()
+    probe = getattr(ops, '_native_attention_level_mask', None) if ops is not None else None
+    if probe is None:
+        _PROBE_ERROR = None
+        return 0
+    try:
+        value = int(probe(q))
+    except Exception as exc:  # a capability probe fails closed, never open
+        _PROBE_ERROR = '%s: %s' % (type(exc).__name__, exc)
+        return 0
+    _PROBE_ERROR = None
+    return value
+
+
+def _native_visibility_mask(q):
+    """Visibilities (bit 0 full, 1 window, 2 chunk) the native leaf serves.
+
+    A build without the probe implements full-causal visibility only.
+    """
+    ops = _extension()
+    probe = getattr(ops, '_native_precision_visibility_mask', None) if ops is not None else None
+    if probe is None:
+        return 0x1
+    try:
+        return int(probe(q))
+    except Exception:  # a capability probe fails closed
+        return 0
+
+
+def _no_native_message(q, level, deterministic, native_levels, major, minor):
+    ops = _extension()
+    if ops is None:
+        return ('no advanced-precision backward is available: importing the extension failed (%s), '
+                'so no implementation is linked; nothing was run and no fallback was substituted'
+                % (_EXTENSION_ERROR,))
+    missing = [name for name in required_precision_ops(deterministic) if not hasattr(ops, name)]
+    if missing:
+        detail = 'missing ops: ' + ', '.join(missing)
+    elif _PROBE_ERROR is not None:
+        detail = 'the availability probe raised (%s), so nothing is claimed' % _PROBE_ERROR
+    else:
+        detail = 'the level mask does not set bit %d' % level
+    return ('no native advanced-precision backward for level %d%s on %s (sm_%d%d): '
+            '_native_attention_level_mask=0x%x, %s. A native build must link the complete component '
+            'set of that branch; nothing was run and no SM90-named alias or lower level is '
+            'substituted' % (level, ' (deterministic)' if deterministic else '', q.device,
+                             major, minor, native_levels, detail))
+
+
+def _resolve_backend(backend, q, level, deterministic, visibility, info=None):
+    """Return 'sm90' or 'native' for this call, or raise saying what is absent.
+
+    Both implementations are registered under the same op names
+    (DefineAttentionPrecisionOps is built once, for the SM90 or for the native
+    precision source set), so this function decides whether the call may
+    proceed and which implementation the caller is claiming; it does not pick a
+    symbol.  The name alone never decides: `sm90` is refused off SM90 hardware
+    and on a build that advertises native support for this level there,
+    `native` is refused unless the build and device link the exact branch, and
+    `auto` follows the device class -- the SM90 route on a major-9 device
+    whatever the mask says, so that a mask which is a build-time constant can
+    never move an SM90 baseline onto a native kernel, and the native route
+    everywhere else.
+
+    Classes: ValueError when no implementation of this level exists on this
+    device/build (as the seed raised), NotImplementedError when the build
+    advertises the level and its symbols disagree with the mask, or when the
+    advertised native implementation does not cover the requested visibility.
+    """
+    global _LAST_MASK, _LAST_CAPABILITY, _LAST_PROBE_ERROR
+    _LAST_MASK, _LAST_CAPABILITY, _LAST_PROBE_ERROR = 0, (0, 0), None
+    if info is None:
+        info = {}
+    info.clear()
+    info.update(capability=(0, 0), native_mask=0, probe_error=None)
+    name = _check_backend_name(backend)
+    major, minor = torch.cuda.get_device_capability(q.device)
+    native_levels = _native_level_mask(q)
+    _LAST_MASK, _LAST_CAPABILITY = native_levels, (major, minor)
+    _LAST_PROBE_ERROR = _PROBE_ERROR
+    info.update(capability=(major, minor), native_mask=native_levels,
+                probe_error=_PROBE_ERROR)
+    if name == 'sm90':
+        if major != 9:
+            raise ValueError(
+                "backend='sm90' is SM90-only and device %s is sm_%d%d; it is never an alias for a "
+                "native implementation, so pass backend='native' (or 'auto') where a native one "
+                "exists" % (q.device, major, minor))
+        if native_levels & (1 << level):
+            raise ValueError(
+                "backend='sm90' on the SM90 device %s, but the loaded extension advertises a native "
+                "implementation for level %d there (mask 0x%x); the request and the build disagree "
+                "about which implementation would run" % (q.device, level, native_levels))
+        return 'sm90'
+    if name == 'auto' and major == 9:
+        # The device class decides the route, but a build that advertises
+        # native support for this level while its linked symbols disagree is
+        # an inconsistent build.  It is named here, as the same
+        # NotImplementedError the native route raises, instead of surfacing
+        # later from the legacy symbol check as a RuntimeError.
+        if native_levels & (1 << level):
+            ops = _extension()
+            missing = [op for op in required_precision_ops(deterministic)
+                       if ops is None or not hasattr(ops, op)]
+            if missing:
+                raise NotImplementedError(
+                    'device %s advertises native advanced-precision level %d%s (mask 0x%x) but the '
+                    'linked build lacks %s; the availability mask and the symbol table disagree, so '
+                    'nothing was run' % (q.device, level,
+                                         ' (deterministic)' if deterministic else '',
+                                         native_levels, ', '.join(missing)))
+        return 'sm90'
+    if native_levels & (1 << level):
+        ops = _extension()
+        missing = [op for op in required_precision_ops(deterministic)
+                   if ops is None or not hasattr(ops, op)]
+        if missing:
+            raise NotImplementedError(
+                'device %s advertises native advanced-precision level %d%s (mask 0x%x) but the '
+                'linked build lacks %s; the availability mask and the symbol table disagree, so '
+                'nothing was run' % (q.device, level,
+                                     ' (deterministic)' if deterministic else '',
+                                     native_levels, ', '.join(missing)))
+        if not (_native_visibility_mask(q) >> visibility) & 1:
+            raise NotImplementedError(
+                'the native advanced-precision backward of this build does not implement '
+                'visibility=%r (implemented visibility mask 0x%x); level %d is not silently '
+                'replaced by another schedule' % (visibility, _native_visibility_mask(q), level))
+        return 'native'
+    raise ValueError(_no_native_message(q, level, deterministic, native_levels, major, minor))
 
 
 def backward(dy, q, k, v, *, visibility, span=None, scale=None,
              prev_k=None, prev_v=None, q_segment_idx=None, k_segment_idx=None,
              segment_idx=None, bos_mask=None, reset=False, strict=False,
-             deterministic=False, backend='sm90', return_fp32=False):
-    if backend.strip().lower() not in ('', 'auto', 'sm90'):
-        raise ValueError('advanced precision requires the SM90 backend')
-    if not q.is_cuda or torch.cuda.get_device_capability(q.device)[0] != 9:
-        raise ValueError('advanced precision requires an SM90 CUDA device')
+             deterministic=False, backend='auto', return_fp32=False):
+    _check_backend_name(backend)
+    if not q.is_cuda:
+        raise ValueError('high precision requires a CUDA device')
     if q.dim() != 4 or k.dim() != 4 or v.dim() != 4:
         raise ValueError('precision readers require rank-four Q/K/V')
     if (prev_k is None) != (prev_v is None):
@@ -75,10 +400,23 @@ def backward(dy, q, k, v, *, visibility, span=None, scale=None,
         q, scale = torch.zeros_like(q), 1.0
     if reset and visibility != 2:
         raise ValueError('reset positions apply only to sliding chunks')
+    # Every argument is validated before the capability decision, so a call
+    # with a bad argument on an unsupported device reports the argument. The
+    # resolution then decides which implementation this call may use, or
+    # raises naming exactly what is absent, and it leaves a route record
+    # either way.
+    if q.is_cuda and torch.cuda.get_device_capability(q.device)[0] == 10:
+        # Blackwell supports only deterministic attention: the unordered-atomic branch
+        # (main backward + probability repair, anchor-scatter zero-sum repair) is never
+        # run there, whatever the caller's flag says.
+        deterministic = True
+    resolved_backend = _resolve_call_backend(backend, q, _NATIVE_REPAIR_BIT, deterministic,
+                                             visibility)
     if reset and qi is not None:
         from ._sca_segment_alignment import needs_matched_reset
         if needs_matched_reset(q, qi, ki, True):
-            outputs = _matched_backward(dy, q, kt, vt, qi, ki, span, scale, strict, deterministic)
+            outputs = _matched_backward(dy, q, kt, vt, qi, ki, span, scale, strict, deterministic,
+                                        resolved_backend)
             outputs = _restore_scale_gradients(outputs, original_scale)
             return _finish(outputs, q.dtype, previous, return_fp32)
     q, kt, vt, dy = (x.contiguous() for x in (q, kt, vt, dy))
@@ -121,7 +459,7 @@ def backward(dy, q, k, v, *, visibility, span=None, scale=None,
         right = torch.where(runs, torch.minimum(right, last), right)
         exact = runs.to(torch.int32).reshape(b).contiguous()
     left, right = left.contiguous(), right.contiguous()
-    ops = _ops()
+    ops = _ops(_NATIVE_REPAIR_BIT, deterministic, device=q.device)
     kc, _ = ops._attention_precision_center(kt)
     vc, _ = ops._attention_precision_center(vt)
     dy, inverse_prescale = _prescale_fp16(dy, vc)
@@ -244,7 +582,8 @@ def _finish(outputs, dtype, previous, keep_fp32):
             dk[:, :previous].contiguous(), dv[:, :previous].contiguous())
 
 
-def _matched_backward(dy, q, k, v, qi, ki, chunk, scale, strict, deterministic):
+def _matched_backward(dy, q, k, v, qi, ki, chunk, scale, strict, deterministic,
+                      backend='auto'):
     # Irregular independently aligned reset runs use the same exact packing
     # plan as the existing API. No N² mask is allocated. The common aligned
     # BOS path above remains entirely GPU-driven.
@@ -260,7 +599,8 @@ def _matched_backward(dy, q, k, v, qi, ki, chunk, scale, strict, deterministic):
         qa, qb, ka, kb = cq[index], cq[index + 1], ck[index], ck[index + 1]
         a, b, c, _, _ = backward(gp[qa:qb][None], qp[qa:qb][None], kp[ka:kb][None], vp[ka:kb][None],
                                 visibility=2, span=chunk, scale=scale,
-                                strict=strict, deterministic=deterministic, return_fp32=True)
+                                strict=strict, deterministic=deterministic, backend=backend,
+                                return_fp32=True)
         oq[qa:qb], ok[ka:kb], ov[ka:kb] = a[0], b[0], c[0]
     result = []
     for tensor, original, indices in ((oq, q, plan.q_indices), (ok, k, plan.k_indices), (ov, v, plan.k_indices)):
@@ -303,6 +643,7 @@ class _Attention(torch.autograd.Function):
 
 
 def apply(q, k, v, *, visibility, prev_k=None, prev_v=None, **options):
-    # Fail before doing a forward if the installed binary predates this API.
-    _ops()
+    # Fail before doing a forward if the installed binary lacks the branch the
+    # backward will execute.
+    _ops(_NATIVE_REPAIR_BIT, bool(options.get('deterministic', False)), device=q.device)
     return _Attention.apply(q, k, v, prev_k, prev_v, visibility, options)
