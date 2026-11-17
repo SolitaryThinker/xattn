@@ -628,6 +628,8 @@ NATIVE_SCA_SOURCES = {
     # between, never one without the other.
     "driver": CSRC / "flash_sca" / "native" / "umma_bwd.cu",
     "dispatch": CSRC / "flash_sca" / "native" / "dispatch.cu",
+    # Row bounds of a BOS mask in one launch (the route's metadata reduction).
+    "row_bounds": CSRC / "flash_sca" / "native" / "row_bounds.cu",
     "kernels": sorted(
         (CSRC / "flash_sca" / "native" / "instantiations").glob("*.cu")
     ),

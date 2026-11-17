@@ -12,12 +12,32 @@ enum class BackwardProduct { kDq, kDkdv, kAtomicDq };
 // Real dimensions, formats, operands, maps and device resources are checked
 // by the selected entry's complete predicate, never by this bucket test.
 #define XATTN_SCA_BACKWARD_BUCKETS(M) M(128, 128) M(256, 256)
+// The buckets served by the pipelined dQ and fused M128 key leaves templated on (D, Dv)
+// (umma_bwd_pipe_small.cuh), with no fused in-situ body: their registry rows name those leaves'
+// level-0 preflights directly, and every call they refuse runs the generic body.
+#define XATTN_SCA_BACKWARD_PIPE_BUCKETS(M) M(64, 64) M(64, 128) M(128, 64)
+// The buckets at the four unequal (D, Dv) pairs the public API accepts with D + Dv > 256 and
+// D, Dv <= 256 (the dQ leg first, then the key leg). The fused M128 key leaf's
+// map holds dK's D and dV's Dv in TMEM columns 0..255 and refuses every one of these (D + Dv >
+// 256), so their key product is instead the dV-only/dK-only M128 pair (umma_bwd_dkdv.cuh:
+// kDkdvPairFits, LaunchUmmaBackwardInSituDkdv), a capacity-rule leaf the registry (below) names
+// with a kDkdv row at these buckets. Their dQ product takes the pipelined dQ-only leaf, whose
+// map comes from (D, Dv) alone (umma_bwd_dq_pipe.cuh:Plan), through the dQ-only entry of the
+// same header.
+#define XATTN_SCA_BACKWARD_DQ_PIPE_BUCKETS(M) M(256, 64) M(256, 128) M(128, 256) M(64, 256)
 
 inline bool BackwardLeafCompiled(BackwardProduct product, int64_t d, int64_t dv) {
   if (product != BackwardProduct::kDq && product != BackwardProduct::kDkdv) return false;
   const int kd = QkBucket(d), kv = ValueBucket(dv);
 #define XATTN_SCA_MATCH_BUCKET(D, V) if (kd == D && kv == V) return true;
   XATTN_SCA_BACKWARD_BUCKETS(XATTN_SCA_MATCH_BUCKET)
+  XATTN_SCA_BACKWARD_PIPE_BUCKETS(XATTN_SCA_MATCH_BUCKET)
+  // Both products are compiled at these buckets now: the dQ-only pipelined leaf and the
+  // dV-only/dK-only M128 pair, named by the same registry row's two function pointers
+  // (sca_umma_bwd_registry.cu:XATTN_SCA_DQ_PIPE_ENTRY). This test must change in the same round
+  // as that registry row: reporting a product compiled here without a matching row promises a
+  // leaf the link does not have.
+  XATTN_SCA_BACKWARD_DQ_PIPE_BUCKETS(XATTN_SCA_MATCH_BUCKET)
 #undef XATTN_SCA_MATCH_BUCKET
   return false;
 }

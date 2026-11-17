@@ -270,10 +270,14 @@ struct BackwardDkdvPlan {
   // The M128 map is only budgeted for the bucket it is instantiated for. At (256,256)
   // dK and dV alone would need 512 columns and S^T/dP^T would have nowhere to live;
   // a dV-only launch there needs dV 0..255 + S^T 256..383 only.
+  // General by capacity, not by bucket name: the dV-only M128 map needs only kDv <= 256
+  // TMEM columns for its accumulator plus the fixed 256..383 S^T/dP^T window (kD sets only
+  // how much K this leaf stages, with no column requirement of its own).
   static_assert(kKeyRows == 64 || (kKeyRows == 128 && kD == 128 && kDv == 128) ||
-                    (kDvOnlyM128 && kD == 256 && kDv == 256),
+                    (kDvOnlyM128 && kD % 64 == 0 && kDv % 64 == 0 && kD > 0 && kD <= 256 &&
+                     kDv > 0 && kDv <= 256),
                 "an M128 key tile is only mapped for the (128,128) bucket and for the "
-                "dV-only launch at (256,256)");
+                "dV-only launch at every (D, Dv) with D, Dv <= 256");
 
   static constexpr int kSlabsK = kD / 64;   // D  in 64-column slabs (Q and K tiles)
   static constexpr int kSlabsV = kDv / 64;  // Dv in 64-column slabs (V and dO tiles)
@@ -1412,16 +1416,26 @@ inline bool KeyArmPair128pRequested() {
   const char* value = std::getenv("XATTN_SCA_BWD_KEY_ARM");
   return value != nullptr && std::strcmp(value, "pair128p") == 0;
 }
-// The two leaves of the (256,256) pair: the pipelined dV-only M128 leaf (umma_bwd_dv_pipe.cuh;
-// its preflight is UmmaBackwardDkdvCanLaunch<E, 256, 256, 2, 128, 0>) and the pipelined dK-only
-// M128 leaf (umma_bwd_dk_pipe.cuh). Defined in those headers and instantiated for BF16 and FP16
-// in instantiations/sca_umma_bwd_dkdv_d256_v256.cu, the TU whose in-situ launch reaches them.
-template <typename E>
+// The two leaves of the pair: the pipelined dV-only M128 leaf (umma_bwd_dv_pipe.cuh; its
+// preflight is UmmaBackwardDkdvCanLaunch<E, kD, kDv, 2, 128, 0>) and the pipelined dK-only M128
+// leaf (umma_bwd_dk_pipe.cuh). Defined in those headers and instantiated for BF16 and FP16 at
+// every (D, Dv) the pair serves: (256,256) in instantiations/sca_umma_bwd_dkdv_d256_v256.cu, the
+// four unequal buckets (D + Dv > 256, D, Dv <= 256) in instantiations/sca_umma_bwd_dkdv_pair_d*.cu.
+template <typename E, int kD, int kDv>
 bool LaunchUmmaBackwardDvPipe(const UmmaLaunchParams& lp, cudaStream_t stream);
-template <typename E>
+template <typename E, int kD, int kDv>
 bool CanLaunchUmmaBackwardDkPipe(const UmmaLaunchParams& lp);
-template <typename E>
+template <typename E, int kD, int kDv>
 bool LaunchUmmaBackwardDkPipe(const UmmaLaunchParams& lp, cudaStream_t stream);
+// The capacity rule that selects the pair: both dims multiples of 64, each at most 256 (the
+// pair leaves' TMEM budget, asserted in their own Plan<kD,kDv>), and D + Dv > 256 (below that
+// the fused M64/M128 leaves already serve the bucket more cheaply, and (128,128) has its own
+// pipelined fused leaf). Not a bucket list: every (D, Dv) the public API accepts that satisfies
+// this falls to the pair, whatever D and Dv are, so a kernel added later at a new head dim does
+// not need a new case here.
+template <int kD, int kDv>
+inline constexpr bool kDkdvPairFits = kD % 64 == 0 && kDv % 64 == 0 && kD > 0 && kD <= 256 &&
+                                       kDv > 0 && kDv <= 256 && (kD + kDv > 256);
 // The pipelined fused M128 key leaf at (128,128) (umma_bwd_kv_pipe.cuh): its preflight - the
 // two-stage fused M128 leaf's own (UmmaBackwardDkdvCanLaunch<E, 128, 128, 3, 128, 4>), a key axis
 // that fits in int32 and its own dynamic SMEM - and its launch, which re-tests that preflight
@@ -1435,15 +1449,17 @@ template <typename E>
 bool LaunchUmmaBackwardKvPipe(const UmmaLaunchParams& lp, cudaStream_t stream);
 bool InSituKvPipeWouldLaunch(const UmmaLaunchParams& lp);
 
-// What the in-situ launch at (256,256) and at (128,128) does with a call, decided in ONE place:
-// the launch below acts on it, and InSituKeyPairWouldLaunch (umma_bwd_entry.h) reports it to host
-// code that must know before the launch whether the fused key body will run. The pair and the
-// (128,128) pipelined leaf write dK, dV, dPrevK and dPrevV and nothing else, so no by-product of
-// the fused body exists for a call that takes either.
-//   kPair     (256,256): both pair leaves accept the call: the dV-only leaf, then the dK-only
-//             leaf, runs;
-//   kRefused  (256,256): "pair128p" was named at level 0 and the pair's preflight refused:
-//             nothing runs;
+// What the in-situ launch at every bucket the pair fits and at (128,128) does with a call,
+// decided in ONE place: the launch below acts on it, and InSituKeyPairWouldLaunch
+// (umma_bwd_entry.h) reports it to host code that must know before the launch whether the fused
+// key body will run. The pair and the (128,128) pipelined leaf write dK, dV, dPrevK and dPrevV
+// and nothing else, so no by-product of the fused body exists for a call that takes either.
+//   kPair     kDkdvPairFits<kD,kDv>: both pair leaves accept the call: the dV-only leaf, then
+//             the dK-only leaf, runs;
+//   kRefused  (256,256) only: "pair128p" was named at level 0 and the pair's preflight refused:
+//             nothing runs. Every other bucket the pair fits never reports kRefused - the named
+//             arm's contract (host.cc) is scoped to (256,256) alone, so a refusal elsewhere
+//             falls through to the fused leaf like the unnamed default;
 //   kKvPipe   (128,128): the variable is absent or empty, the call is level 0 and the pipelined
 //             fused M128 leaf's preflight accepts it: that leaf runs;
 //   kFused    every other call, every other bucket included: the fused key body decides.
@@ -1455,12 +1471,15 @@ enum class InSituKeyPairDecision { kFused, kPair, kRefused, kKvPipe };
 
 template <typename E, int kD, int kDv>
 inline InSituKeyPairDecision DecideInSituKeyPair(const UmmaLaunchParams& lp) {
-  if constexpr (kD == 256 && kDv == 256) {
-    const bool named = KeyArmPair128pRequested();
+  if constexpr (kDkdvPairFits<kD, kDv>) {
+    // "pair128p"'s report-refusal-as-kRefused contract stays scoped to (256,256) (host.cc's
+    // documented contract for the variable); every other bucket the capacity rule now admits
+    // treats a preflight refusal like the unnamed default, falling through to the fused leaf.
+    const bool named = (kD == 256 && kDv == 256) && KeyArmPair128pRequested();
     const bool level0 = !lp.params.saved_fp32 && !lp.params.subtract_before_scale;
     if (!level0 || !(named || KeyArmUnsetRequested())) return InSituKeyPairDecision::kFused;
     if (UmmaBackwardDkdvCanLaunch<E, kD, kDv, 2, 128, 0>(lp) &&
-        CanLaunchUmmaBackwardDkPipe<E>(lp)) {
+        CanLaunchUmmaBackwardDkPipe<E, kD, kDv>(lp)) {
       return InSituKeyPairDecision::kPair;
     }
     return named ? InSituKeyPairDecision::kRefused : InSituKeyPairDecision::kFused;
@@ -1478,29 +1497,31 @@ template <typename E, int kD, int kDv>
 bool LaunchUmmaBackwardInSituDkdv(const UmmaLaunchParams& lp, cudaStream_t stream) {
   constexpr int kM = InSituKeyRows<kD, kDv>::value;
   constexpr int kA = InSituKeyArm<kD, kDv>::value;
-  if constexpr (kD == 256 && kDv == 256) {
-    // The default route at (256,256), BF16 and FP16: the pipelined dV-only M128 leaf, then the
-    // pipelined dK-only M128 leaf on the same stream. Together they write every row of dK, dV,
-    // dPrevK and dPrevV - one writer per row per product, no atomics, the fused M64 leaf's
-    // operands in its accumulation order - so their outputs are bit-equal to the fused leaf's at
-    // either determinism setting. Both leaves are asked before either launches (in
-    // DecideInSituKeyPair), so a refusal writes nothing. Their accepted sets are the fused
-    // leaf's keyed on one output each, at the 128-row tile (a stricter previous-plane alignment)
-    // and with more dynamic SMEM, so the fused M64 leaf accepts every call the pair accepts.
+  if constexpr (kDkdvPairFits<kD, kDv>) {
+    // The default route at every (D, Dv) with D + Dv > 256 and D, Dv <= 256, BF16 and FP16:
+    // the pipelined dV-only M128 leaf, then the pipelined dK-only M128 leaf on the same stream.
+    // Together they write every row of dK, dV, dPrevK and dPrevV - one writer per row per
+    // product, no atomics, the fused leaf's operands in its accumulation order - so their
+    // outputs are bit-equal to the fused leaf's at either determinism setting. Both leaves are
+    // asked before either launches (in DecideInSituKeyPair), so a refusal writes nothing. Their
+    // accepted sets are the fused leaf's keyed on one output each, at the 128-row tile (a
+    // stricter previous-plane alignment) and with more dynamic SMEM, so the fused leaf accepts
+    // every call the pair accepts.
     const InSituKeyPairDecision decision = DecideInSituKeyPair<E, kD, kDv>(lp);
     if (decision == InSituKeyPairDecision::kPair) {
-      const bool ran_v = LaunchUmmaBackwardDvPipe<E>(lp, stream);
-      const bool ran_k = LaunchUmmaBackwardDkPipe<E>(lp, stream);
+      const bool ran_v = LaunchUmmaBackwardDvPipe<E, kD, kDv>(lp, stream);
+      const bool ran_k = LaunchUmmaBackwardDkPipe<E, kD, kDv>(lp, stream);
       if (!ran_v || !ran_k) {
         throw std::runtime_error(
-            "flash_sca native bwd (256,256) M128 pair: a leaf refused after its preflight");
+            "flash_sca native bwd M128 pair: a leaf refused after its preflight");
       }
       InSituLaunchedKeyRows() = 128;
       return true;
     }
     // A NAMED pair at LEVEL 0 whose preflight refused is REPORTED, not silently served by the
     // fused leaf: a timing arm must not measure a body it did not name. Levels 1-4 never decide
-    // kRefused, and neither does an absent or empty variable.
+    // kRefused, neither does an absent or empty variable, and neither does any bucket but
+    // (256,256) (the named arm's scope).
     if (decision == InSituKeyPairDecision::kRefused) return false;
   }
   if constexpr (kD == 128 && kDv == 128) {

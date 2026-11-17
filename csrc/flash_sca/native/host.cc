@@ -37,6 +37,7 @@
 //   XATTN_SCA_BWD_KEY_ARM     umma_bwd_dkdv.cuh     KeyArmUnsetRequested() /    key body arm: unset/empty/"pair128p", or
 //                                                   KeyArmPair128pRequested()   any other value forces the fused leaf
 //   XATTN_SCA_BWD_LEGTIME     umma_bwd.cu           LegTimeMode()               measurement only; once per process
+//   XATTN_SCA_BWD_SERIAL      umma_bwd.cu           BwdLeavesSerialForced()     probe only: forces both native leaves onto one stream; per call, default off, no check sets it
 //   XATTN_SCA_BWD_DIAGNOSTIC  host.cc               BackwardDiagnosticRequested()  record only, changes no number; once per process
 //
 // Refusal is the rule for the strict parsers, and stating it of every reader would be
@@ -151,6 +152,7 @@
 #include "flash_sca/native/registration.h"
 #include "flash_sca/native/row_bounds.h"
 #include "flash_sca/native/umma_bwd.h"
+#include "flash_sca/native/row_bounds.h"
 #include "flash_sca/native/umma_fwd_pipe_host.h"
 #include "flash_sca/native/umma_prepare.h"
 
@@ -1252,8 +1254,8 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, OptionalTensor, OptionalTensor> B
     // No atomic dQ accumulator on B300 (deterministic-only): p.dq_accum stays null, so the
     // generic body writes dQ row-owned in a fixed order.
     at::Tensor dq_accum;
-    LaunchTileBounds(p, stream);
-    if (p.row_lo != nullptr) LaunchKeyTileRange(p, stream);
+    // The native delta stage now builds delta, the query tile bounds and the key
+    // tile range in one launch (launch.cuh:BackwardDeltaStage); nothing here.
     LaunchBackward(p, stream);
     if (dq_accum.defined()) {
       dq.copy_(dq_accum.mul_(p.scale));
@@ -1285,8 +1287,8 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, OptionalTensor, OptionalTensor> B
     dprev_k->zero_();
     dprev_v->zero_();
   }
-  LaunchTileBounds(p, stream);
-  if (p.row_lo != nullptr) LaunchKeyTileRange(p, stream);
+  // delta + query tile bounds + key tile range are one launch inside
+  // LaunchBackwardPhases's delta stage (launch.cuh:BackwardDeltaStage).
   LaunchBackwardPhases(p, umma.launch, phases, stream);
   // Which key tile ACTUALLY launched, per call, after the launch. `key_rows` was set above
   // from the row's static value, which is the arm the BUCKET prefers; at (128,128) the M128
@@ -1608,6 +1610,35 @@ py::list BwdLegTimeRows() {
   return rows;
 }
 
+// Row bounds of a packed-sequence BOS mask, in one launch (row_bounds.cu).
+// Called from `xattn/ops/_sca_native.py` where the route used to reduce the mask
+// with a chain of torch ops; the values are the same ones, bit for bit.
+std::vector<at::Tensor> RowBoundsFromBos(const at::Tensor& bos_mask, int64_t q_length,
+                                         int64_t total, int64_t chunk_size, bool strict_past,
+                                         bool reset) {
+  TORCH_CHECK(bos_mask.is_cuda(), "native FlashSCA row bounds require a CUDA bos_mask");
+  TORCH_CHECK(bos_mask.scalar_type() == at::kBool && bos_mask.dim() == 2,
+              "native FlashSCA row bounds need a bool [B, total] bos_mask");
+  TORCH_CHECK(bos_mask.is_contiguous(), "native FlashSCA row bounds need a contiguous bos_mask");
+  TORCH_CHECK(q_length > 0 && q_length <= total, "native FlashSCA row bounds need 0 < Nq <= T");
+  TORCH_CHECK(chunk_size > 0, "native FlashSCA row bounds need a positive chunk_size");
+  TORCH_CHECK(total < (int64_t(1) << 31) - 64 && bos_mask.size(0) <= 65535,
+              "native FlashSCA row bounds: total key length or batch out of range");
+  TORCH_CHECK(bos_mask.size(1) == total, "native FlashSCA row bounds: bos_mask must be [B, T]");
+  c10::cuda::CUDAGuard guard(bos_mask.device());
+  const int64_t batch = bos_mask.size(0);
+  auto options = bos_mask.options().dtype(at::kInt);
+  std::vector<at::Tensor> out{at::empty({batch, q_length}, options),
+                              at::empty({batch, q_length}, options)};
+  if (batch == 0) return out;
+  const cudaStream_t stream = at::cuda::getCurrentCUDAStream(bos_mask.get_device());
+  LaunchRowBoundsFromBos(reinterpret_cast<const unsigned char*>(bos_mask.data_ptr<bool>()),
+                         out[0].data_ptr<int32_t>(), out[1].data_ptr<int32_t>(), batch, total,
+                         q_length, total - q_length, static_cast<int32_t>(chunk_size),
+                         strict_past, reset, stream);
+  return out;
+}
+
 }  // namespace
 }  // namespace flash_sca_native
 
@@ -1716,6 +1747,11 @@ void DefineNativeFlashSCAOps(py::module& m) {
            "level-0 default at that bucket while XATTN_SCA_BWD_DQ_PIPE is unset, empty or 1); "
            "never reset, read it by difference across a call. The phase tags record it and "
            "DqKernel alike as umma, so this count is what tells them apart")
+      .def("_flash_sca_row_bounds", &RowBoundsFromBos,
+           "Row bounds [row_lo, row_hi] (int32 [B, Nq]) of a packed-sequence BOS mask, one "
+           "launch; the same values the torch reduction produced",
+           py::arg("bos_mask"), py::arg("q_length"), py::arg("total"), py::arg("chunk_size"),
+           py::arg("strict_past"), py::arg("reset"))
       .def("_flash_sca_native_fwd", &Forward, "Native Blackwell FlashSCA forward",
            py::arg("q"), py::arg("k"), py::arg("v"), py::arg("prev_k"), py::arg("prev_v"),
            py::arg("chunk_size"), py::arg("scale"), py::arg("q_segment_idx"),

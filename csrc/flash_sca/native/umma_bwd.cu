@@ -1,4 +1,7 @@
 // Exclusive backward producer scheduling and dispatch-matched preflight.
+#include <c10/cuda/CUDAException.h>
+#include <c10/cuda/CUDAFunctions.h>
+#include <c10/cuda/CUDAStream.h>
 #include <c10/util/Exception.h>
 
 #include <atomic>
@@ -428,6 +431,14 @@ void LaunchLeaf(umma::BackwardProduct product, const umma::UmmaLaunchParams& cal
 
 }  // namespace
 
+// XATTN_SCA_BWD_SERIAL: force the two native leaves back onto one stream. A probe's
+// switch, read per call and off by default; no gate check sets it. It exists because the
+// overlap is a scheduling change whose A/B has to be one build, two arms, one job.
+bool BwdLeavesSerialForced() {
+  const char* v = std::getenv("XATTN_SCA_BWD_SERIAL");
+  return v != nullptr && v[0] != '\0' && v[0] != '0';
+}
+
 // The timer's public face: declared in umma_bwd.h so the host snapshot and the drain
 // binding can read it. All three return empty/0 with the mode off, so a default build
 // makes no CUDA call and never even constructs the ring.
@@ -540,11 +551,40 @@ void LaunchBackwardPhases(const Params& params, const umma::UmmaLaunchParams& na
   call.params = params;
   LaunchBackwardStages(params, stream, kStageDelta);
   if (legtime) LegBoundary(kLegAfterDelta, stream);
-  if (phases.native.dq) LaunchLeaf(umma::BackwardProduct::kDq, call, stream);
-  if (legtime) LegBoundary(kLegAfterDq, stream);
-  if (phases.native.dkdv) LaunchLeaf(umma::BackwardProduct::kDkdv, call, stream);
-  if (phases.native.dkdv_atomic_dq) LaunchLeaf(umma::BackwardProduct::kAtomicDq, call, stream);
-  if (legtime) LegBoundary(kLegAfterKey, stream);
+  // The two native leaves own disjoint outputs -- the dQ leaf writes only dQ, the key leaf
+  // only dK/dV -- and neither writes atomically, so nothing about the result depends on
+  // their order or on whether they overlap: run them on two streams and join before the
+  // call returns. It is worth doing because the key leaf's CTAs are not equally heavy: at
+  // the MoE rows its 1024 CTAs (6.9 waves of a 148-SM GPU) carry 2 to 128 query tiles each
+  // (mean 33), so its last wave leaves SMs idle while the dQ leaf's 4096 CTAs (27.7 waves,
+  // mean 17) could be using them. The key leaf is enqueued first so that its tail is the
+  // part the dQ leaf fills, the event join puts both back in front of anything the caller
+  // enqueues next. The leg timer measures the serial order, so it keeps it.
+  const bool overlap = phases.native.dq && phases.native.dkdv &&
+      !phases.native.dkdv_atomic_dq && !legtime && !BwdLeavesSerialForced();
+  if (overlap) {
+    const c10::cuda::CUDAStream fork =
+        c10::cuda::getStreamFromPool(/*isHighPriority=*/false, c10::cuda::current_device());
+    cudaEvent_t ready = nullptr;
+    cudaEvent_t done = nullptr;
+    C10_CUDA_CHECK(cudaEventCreateWithFlags(&ready, cudaEventDisableTiming));
+    C10_CUDA_CHECK(cudaEventCreateWithFlags(&done, cudaEventDisableTiming));
+    C10_CUDA_CHECK(cudaEventRecord(ready, stream));
+    C10_CUDA_CHECK(cudaStreamWaitEvent(fork.stream(), ready, 0));
+    LaunchLeaf(umma::BackwardProduct::kDkdv, call, stream);
+    LaunchLeaf(umma::BackwardProduct::kDq, call, fork.stream());
+    C10_CUDA_CHECK(cudaEventRecord(done, fork.stream()));
+    C10_CUDA_CHECK(cudaStreamWaitEvent(stream, done, 0));
+    C10_CUDA_CHECK(cudaEventDestroy(ready));
+    C10_CUDA_CHECK(cudaEventDestroy(done));
+    if (legtime) LegBoundary(kLegAfterKey, stream);
+  } else {
+    if (phases.native.dq) LaunchLeaf(umma::BackwardProduct::kDq, call, stream);
+    if (legtime) LegBoundary(kLegAfterDq, stream);
+    if (phases.native.dkdv) LaunchLeaf(umma::BackwardProduct::kDkdv, call, stream);
+    if (phases.native.dkdv_atomic_dq) LaunchLeaf(umma::BackwardProduct::kAtomicDq, call, stream);
+    if (legtime) LegBoundary(kLegAfterKey, stream);
+  }
   const unsigned products = phases.generic_stages & ~static_cast<unsigned>(kStageDelta);
   if (products != 0) LaunchBackwardStages(params, stream, products);
   if (legtime) {

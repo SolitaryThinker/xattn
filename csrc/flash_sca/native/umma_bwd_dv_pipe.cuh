@@ -101,8 +101,13 @@ template <int kD, int kDv>
 struct Plan {
   // The dv128 plan: operand image, slab geometry and TMEM columns are taken from it.
   using Base = BackwardDkdvPlan<kD, kDv, kKeyRows, 1, 2>;
-  static_assert(Base::kDvOnlyM128 && kD == 256 && kDv == 256,
-                "the pipelined leaf is the dV-only M128 leaf at (256,256)");
+  // General by capacity, not by bucket name: symmetric to dkpipe::Plan's note above. dV needs
+  // kDv <= 256 TMEM columns (kdVColBase + kDv <= kSCol, asserted below); kD only sets how much
+  // K this leaf stages and carries no TMEM-column requirement of its own.
+  static_assert(Base::kDvOnlyM128 && kD % 64 == 0 && kDv % 64 == 0 && kD > 0 && kD <= 256 &&
+                    kDv > 0 && kDv <= 256,
+                "the pipelined dV-only leaf fits every (D, Dv) with D, Dv <= 256, each a "
+                "multiple of 64");
   static_assert(Base::kVBytes == 0, "the dV-only leaf stages no V");
   static constexpr int kSlabsK = Base::kSlabsK;
   static constexpr int kSlabsV = Base::kSlabsV;
@@ -383,6 +388,11 @@ __global__ void __launch_bounds__(kThreads, 1) BackwardDvPipeKernel(
     // differ only in the query columns they pack (the unpipelined leaf's mapping).
     const uint32_t lane_base = static_cast<uint32_t>(32 * (warp & 3)) << 16;
     __shared__ pt::ColumnMeta smeta[kBwdQueryRows];
+    // lse2 as its own contiguous SoA plane (+512 B static SMEM), read by the pack core
+    // instead of gathered from smeta[c0].lse2; smeta itself (lo/hi/segment) is unchanged and
+    // still feeds BlockIsSuffix/Visible below.
+    __shared__ float smeta_lse2[kBwdQueryRows];
+    __shared__ int32_t smeta_blk[kBwdQueryRows / pt::kBlock];  // block passed BlockIsSuffix
     bool any = false;
     uint32_t r = 0;
     QueryTileMask m;
@@ -403,25 +413,43 @@ __global__ void __launch_bounds__(kThreads, 1) BackwardDvPipeKernel(
         const int64_t row_in_tile = static_cast<int64_t>(w4 * 32 + lane);
         const int64_t j = kb + row_in_tile;
         const int64_t ks = seg ? kseg[row_in_tile] : 0;
-        uint32_t pv[32], dsv[32];
+        // Suffix-mask precondition (same as dk_pipe, and the same reason): the block must not
+        // straddle a chunk boundary, i.e. the chunk and the query-to-key position shift must be
+        // multiples of the block. Otherwise `lo` jumps inside the block and the mask would admit
+        // keys those columns must not see.
+        const bool suffix_ok = !seg && p.row_lo == nullptr && p.chunk % pt::kBlock == 0 &&
+            (p.total_length - p.q_length) % pt::kBlock == 0;
+        uint32_t pv[32];  // P^T pairs only: dV += P^T dO needs no dS^T, so none is produced
         // smeta is rewritten here only after every pack thread passed the previous round's
         // in-loop barrier, which follows its last read of smeta (rounds are processed in order).
         for (int sc = tid; sc < kBwdQueryRows; sc += kPackThreads) {
           const int64_t ic = i0 + sc;
-          smeta[sc] = pt::ColumnOf(p, b, hq, ic, seg, ic < p.q_length);
+          const pt::ColumnMeta cm = pt::ColumnOf(p, b, hq, ic, seg, ic < p.q_length);
+          smeta[sc] = cm;
+          smeta_lse2[sc] = cm.lse2;
+          // Warps 0..3 hold the round's four 32-column blocks, one column per lane.
+          const bool blk_ok = pt::BlockIsSuffix(cm.lo, cm.hi, cm.segment, seg);
+          if (lane == 0) smeta_blk[sc / pt::kBlock] = blk_ok ? 1 : 0;
         }
         PackBarrierSync();
         const int blk0 = (tid >= kBwdQueryRows) ? kBwdQueryRows / pt::kBlock / 2 : 0;
         for (int blk = blk0; blk < blk0 + kBwdQueryRows / pt::kBlock / 2; ++blk) {
           const int c0 = blk * pt::kBlock;
-          float s[pt::kBlock], dp[pt::kBlock] = {};
+          float s[pt::kBlock];
           TmemLoadCols(lane_base | (tbase + scol + c0), s, pt::kBlock);
+          uint32_t* pvp = pv + 16 * (blk & 1);
           if (full) {
-            pt::MakePtBlockFull<E, pt::kBlock>(s, dp, &smeta[c0], p.scale_log2,
-                                              pv + 16 * (blk & 1), dsv + 16 * (blk & 1));
+            pt::MakePtBlockFullPSoA<E, pt::kBlock>(s, &smeta_lse2[c0], p.scale_log2, pvp);
+          } else if (suffix_ok || smeta_blk[blk] != 0) {
+            // For key row j the visible query columns are a suffix of the 32-column block
+            // (lo constant, hi slope 1, one segment: pt::SuffixMask, pt::BlockIsSuffix), for
+            // the whole launch by the analytic guard or for this block by its metadata.
+            const uint32_t mask = pt::BlockSuffixMask(j, smeta[c0].hi, smeta[c0].lo,
+                                                      smeta[c0].segment, ks, seg, pt::kBlock);
+            pt::MakePtBlockSuffixPSoA<E, pt::kBlock>(s, &smeta_lse2[c0], mask, p.scale_log2, pvp);
           } else {
-            pt::MakePtBlock<E, pt::kBlock>(s, dp, &smeta[c0], j, ks, seg, p.scale_log2,
-                                           pv + 16 * (blk & 1), dsv + 16 * (blk & 1));
+            pt::MakePtBlockFastPSoA<E, pt::kBlock>(s, &smeta_lse2[c0], &smeta[c0], j, ks, seg,
+                                                   p.scale_log2, pvp);
           }
           if (blk & 1) {
             const int pair = blk >> 1;
@@ -456,7 +484,10 @@ __global__ void __launch_bounds__(kThreads, 1) BackwardDvPipeKernel(
     }
     const int rr = 32 * (warp & 3) + lane;
     const int64_t j = kb + rr;
-    const int cols = kD > kDv ? kD : kDv;
+    // This leaf writes dV only, whose accumulator holds exactly kDv TMEM columns
+    // (kdVColBase..kdVColBase+kDv-1): at kD != kDv (the unequal buckets) max(kD, kDv) here
+    // read columns past the accumulator instead of the dV width alone.
+    const int cols = kDv;
     const int64_t width = p.value_dim;
     const float mul = 1.f;
     void* row_out = nullptr;
@@ -492,15 +523,15 @@ __global__ void __launch_bounds__(kThreads, 1) BackwardDvPipeKernel(
 }  // namespace dvpipe
 
 // Launch entry of the pipelined dV-only leaf (declared in umma_bwd_dkdv.cuh, instantiated for
-// BF16 and FP16 in instantiations/sca_umma_bwd_dkdv_d256_v256.cu). Its refusal set is the
-// unpipelined dV-only leaf's
-// (UmmaBackwardDkdvCanLaunch<E, 256, 256, 2, 128, 0>: accepted set, bucket and real
+// BF16 and FP16 at every (D, Dv) the pair serves: (256,256) in
+// instantiations/sca_umma_bwd_dkdv_d256_v256.cu, the four unequal buckets in
+// instantiations/sca_umma_bwd_dkdv_pair_d*.cu). Its refusal set is the unpipelined dV-only
+// leaf's (UmmaBackwardDkdvCanLaunch<E, kD, kDv, 2, 128, 0>: accepted set, bucket and real
 // dimensions, element, device 10.3, SMEM capacity - this plan asks no more dynamic SMEM than
 // that one, asserted above); `false` means nothing was written, and after it every driver or
 // launch error raises, exactly like LaunchUmmaBackwardDkdv.
-template <typename E>
+template <typename E, int kD, int kDv>
 bool LaunchUmmaBackwardDvPipe(const UmmaLaunchParams& lp, cudaStream_t stream) {
-  constexpr int kD = 256, kDv = 256;
   using Pl = dvpipe::Plan<kD, kDv>;
   const Params& p = lp.params;
   if (!UmmaBackwardDkdvCanLaunch<E, kD, kDv, 2, dvpipe::kKeyRows, 0>(lp)) return false;

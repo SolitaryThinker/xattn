@@ -33,25 +33,25 @@ template bool xattn::ops::flash_sca_native::umma::LaunchUmmaBackwardDkdv<__nv_bf
 // The (256,256) pair, which the in-situ launch above runs at level 0 instead of the fused M64
 // leaf whenever both leaves accept the call. First the dV-only M128 leaf, warp-specialized and
 // pipelined (umma_bwd_dv_pipe.cuh), BF16:
-template bool xattn::ops::flash_sca_native::umma::LaunchUmmaBackwardDvPipe<__nv_bfloat16>(
-    const xattn::ops::flash_sca_native::umma::UmmaLaunchParams&, cudaStream_t);
+template bool xattn::ops::flash_sca_native::umma::LaunchUmmaBackwardDvPipe<__nv_bfloat16, 256,
+    256>(const xattn::ops::flash_sca_native::umma::UmmaLaunchParams&, cudaStream_t);
 
 // Then the dK-only M128 leaf, warp-specialized and pipelined over 64-query rounds
 // (umma_bwd_dk_pipe.cuh), BF16:
-template bool xattn::ops::flash_sca_native::umma::CanLaunchUmmaBackwardDkPipe<__nv_bfloat16>(
-    const xattn::ops::flash_sca_native::umma::UmmaLaunchParams&);
-template bool xattn::ops::flash_sca_native::umma::LaunchUmmaBackwardDkPipe<__nv_bfloat16>(
-    const xattn::ops::flash_sca_native::umma::UmmaLaunchParams&, cudaStream_t);
+template bool xattn::ops::flash_sca_native::umma::CanLaunchUmmaBackwardDkPipe<__nv_bfloat16, 256,
+    256>(const xattn::ops::flash_sca_native::umma::UmmaLaunchParams&);
+template bool xattn::ops::flash_sca_native::umma::LaunchUmmaBackwardDkPipe<__nv_bfloat16, 256,
+    256>(const xattn::ops::flash_sca_native::umma::UmmaLaunchParams&, cudaStream_t);
 
 // The same pair for FP16: the dV leaf's preflight (the BF16 one is instantiated above), the
 // dV leaf, then the dK leaf.
 template bool xattn::ops::flash_sca_native::umma::UmmaBackwardDkdvCanLaunch<__half, 256, 256, 2,
     128, 0>(const xattn::ops::flash_sca_native::umma::UmmaLaunchParams&);
-template bool xattn::ops::flash_sca_native::umma::LaunchUmmaBackwardDvPipe<__half>(
+template bool xattn::ops::flash_sca_native::umma::LaunchUmmaBackwardDvPipe<__half, 256, 256>(
     const xattn::ops::flash_sca_native::umma::UmmaLaunchParams&, cudaStream_t);
-template bool xattn::ops::flash_sca_native::umma::CanLaunchUmmaBackwardDkPipe<__half>(
+template bool xattn::ops::flash_sca_native::umma::CanLaunchUmmaBackwardDkPipe<__half, 256, 256>(
     const xattn::ops::flash_sca_native::umma::UmmaLaunchParams&);
-template bool xattn::ops::flash_sca_native::umma::LaunchUmmaBackwardDkPipe<__half>(
+template bool xattn::ops::flash_sca_native::umma::LaunchUmmaBackwardDkPipe<__half, 256, 256>(
     const xattn::ops::flash_sca_native::umma::UmmaLaunchParams&, cudaStream_t);
 
 namespace xattn::ops::flash_sca_native::umma {
@@ -63,11 +63,25 @@ namespace xattn::ops::flash_sca_native::umma {
 bool InSituKeyPairWouldLaunch(const UmmaLaunchParams& lp) {
   const int qk = QkBucket(lp.params.qk_dim), value = ValueBucket(lp.params.value_dim);
   if (qk == 128 && value == 128) return InSituKvPipeWouldLaunch(lp);
-  if (qk != 256 || value != 256) return false;
-  const InSituKeyPairDecision decision =
-      lp.params.element == Element::kBFloat16 ? DecideInSituKeyPair<__nv_bfloat16, 256, 256>(lp)
-                                              : DecideInSituKeyPair<__half, 256, 256>(lp);
-  return decision == InSituKeyPairDecision::kPair;
+  const bool bf16 = lp.params.element == Element::kBFloat16;
+// Dispatch across every (D, Dv) the pair fits (kDkdvPairFits<D,Dv>, umma_bwd_dkdv.cuh): the
+// (256,256) bucket this TU is named for, plus the four unequal buckets whose instantiations
+// live in sca_umma_bwd_dkdv_pair_d*.cu but whose DecideInSituKeyPair<E,D,V> template this TU
+// may also instantiate (header-only up to the leaf calls, which are declared, not defined,
+// here) without redefinition, since each (D, Dv) is a distinct specialization.
+#define XATTN_SCA_PAIR_DECIDE(D, V) \
+  if (qk == D && value == V) { \
+    const InSituKeyPairDecision decision = bf16 ? DecideInSituKeyPair<__nv_bfloat16, D, V>(lp) \
+                                                 : DecideInSituKeyPair<__half, D, V>(lp); \
+    return decision == InSituKeyPairDecision::kPair; \
+  }
+  XATTN_SCA_PAIR_DECIDE(256, 256)
+  XATTN_SCA_PAIR_DECIDE(256, 64)
+  XATTN_SCA_PAIR_DECIDE(256, 128)
+  XATTN_SCA_PAIR_DECIDE(128, 256)
+  XATTN_SCA_PAIR_DECIDE(64, 256)
+#undef XATTN_SCA_PAIR_DECIDE
+  return false;
 }
 
 }  // namespace xattn::ops::flash_sca_native::umma

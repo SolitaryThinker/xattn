@@ -1,3 +1,23 @@
+// Row bounds of the native FlashSCA metadata boundary, on the device, in one launch: both live
+// SCA runs added this header independently, and the combined tree (COMBINED.md) keeps both
+// declarations as each main has them. They compute the same integers.
+//   - The forward main's ids and mask routes, LaunchRowBounds / LaunchRowBoundsMask (defined in
+//     dispatch.cu): the forward's host route (host.cc Forward/ForwardMask, and Backward when a
+//     caller hands it the mask) and _flash_sca_native_row_bounds.
+//   - The backward main's BOS route, LaunchRowBoundsFromBos (defined in row_bounds.cu):
+//     _flash_sca_row_bounds, which the public backward's metadata takes
+//     (xattn/ops/_sca_native.py:visibility with bos_in_call=False).
+#pragma once
+
+#include <cstdint>
+
+#include <cuda_runtime.h>
+#include <cuda_runtime_api.h>
+
+namespace xattn::ops::flash_sca_native {
+
+// ---- The forward main's routes ----
+//
 // The per-query-row visibility bounds of the native FlashSCA metadata boundary, computed on
 // the device in ONE launch instead of by the Python route's ~14-kernel chain
 // (xattn/ops/_sca_native.py:visibility).
@@ -17,13 +37,6 @@
 // The kernel is a metadata kernel like TileBoundsKernel: it belongs to no (D, Dv) bucket and
 // serves every body that reads per-row bounds (the pipelined forward, the generic mma.sync
 // forward, and the backward's leaves), in both element types.
-#pragma once
-
-#include <cstdint>
-
-#include <cuda_runtime_api.h>
-
-namespace xattn::ops::flash_sca_native {
 
 struct RowBoundsArgs {
   const int64_t* ids = nullptr;  // [batch, total], nondecreasing per row
@@ -66,5 +79,36 @@ struct RowBoundsMaskArgs {
 
 void LaunchRowBounds(const RowBoundsArgs& args, cudaStream_t stream);
 void LaunchRowBoundsMask(const RowBoundsMaskArgs& args, cudaStream_t stream);
+
+// ---- The backward main's route ----
+//
+// Row bounds of a BOS mask, on the device, in one launch.
+//
+// The public FlashSCA API accepts `bos_mask` (one `True` at the first token of
+// every document of a packed sequence). Everything the kernels need from it is,
+// per query row, the intersection of the analytic chunk window with the key run
+// of that row's segment (see `RowBounds` in visibility.cuh):
+//
+//   seg_start(p) = position of the last BOS at or before key position p, else 0
+//   lo = max(chunk_base(p), seg_start(p))               (reset: seg_start + local
+//                                                        chunk base inside the run)
+//   hi = p - strict
+//
+// where the query row at index i sits at key position p = i + (total - q_length).
+// The BOS ids are the cumsum of the mask, so a row's segment is exactly this run
+// and the whole rule is that one scan value: the segment's last key is at or
+// after p, so the visibility interval can only be cut short by its start.
+//
+// Before this kernel the route reduced the mask with ~10 torch ops per call
+// (cumsum over [B, total], two `searchsorted` over the packed key axis, ...),
+// measured at 135-157 us/call on every objective shape; that is one launch here.
+
+// Row bounds of one batch of BOS masks. `bos` is a bool (one byte, 0/1) array of
+// shape [batch, total]; `lo`/`hi` are written as [batch, q_length] int32.
+// `shift` is total - q_length (the query axis is right-aligned to the keys).
+void LaunchRowBoundsFromBos(const unsigned char* bos, int32_t* lo, int32_t* hi,
+                            int64_t batch, int64_t total, int64_t q_length, int64_t shift,
+                            int32_t chunk_size, bool strict_past, bool reset,
+                            cudaStream_t stream);
 
 }  // namespace xattn::ops::flash_sca_native

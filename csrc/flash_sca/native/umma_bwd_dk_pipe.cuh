@@ -13,7 +13,8 @@
 // rounds (h = 0, 1), both always. Round r:
 //   S^T  = K Q(r)^T     tcgen05.mma SS, M128 N64, K = D   (16 k-steps), S^T buffer r & 1
 //   dP^T = V dO(r)^T    tcgen05.mma SS, M128 N64, K = Dv  (16 k-steps), dP^T buffer r & 1
-//                       one commit for both: bar_s[r & 1]
+//                       S^T committed on bar_s[r & 1], then dP^T on bar_dp[r & 1], so the
+//                       pack computes P^T while dP^T(r) still runs
 //   dS^T = P^T (dP^T - delta), P^T = exp2(S^T scale_log2 - lse2), masked: the fused leaf's
 //          per-element line (pt::MakePtBlock / MakePtBlockFull on the same ColumnMeta), packed
 //          to 16 bits round-to-nearest-even IN PLACE over the dP^T buffer
@@ -49,6 +50,9 @@
 //               (r + 1) & 1 once Q(r + 1) and dO(r + 1) have landed and dK(r - 1) - the last
 //               reader of those buffers and of that Q stage - has completed; then dK(r) once
 //               pack(r) is done. The tensor core runs S^T/dP^T(r + 1) under pack(r).
+//               (Issue order: S^T(r + 1) once Q(r + 1) landed, BEFORE the wait for
+//               pack(r); then dK(r); then dP^T(r + 1) once dO(r + 1) landed and dK(r - 1) is
+//               complete - see the loop.)
 // The pack warps never use __syncthreads (it would deadlock against warps 8 and 9); the CTA-wide
 // barriers left are the prologue's and the tile exit's, which all 320 threads reach once.
 //
@@ -61,7 +65,7 @@
 //   dO        65,536 ..  98,303   one stage
 //   K         98,304 .. 163,839   128 x 256 16-bit, 4 slabs of 16 KB
 //   V        163,840 .. 229,375
-//   mbarriers 229,376 (16 slots, 10 used), TMEM slot 229,504, envelope words 229,520,
+//   mbarriers 229,376 (16 slots, 12 used; do not widen past 16 - the area is 128 B), TMEM slot 229,504, envelope words 229,520,
 //   ColumnMeta[64] 229,552 .. 231,087 (24 B each); rounded up to 1024 = 231,424, plus 1,024 B
 //   of alignment slack = 232,448 B = the sm_103a opt-in ceiling, exactly. No static SMEM. The
 //   key segments are not staged (each pack thread keeps its own row's in a register).
@@ -76,11 +80,12 @@
 //   MMA  waits bar_dk[(r-1)&1] (dK(r-1)): dK(r-3) observed before S(r-1); dK(r+1) is its own.
 //   MMA  waits bar_pack[r&1] (pack(r)): pack(r-2) observed before dK(r-2); pack(r+2) needs
 //        S(r+2), which it issues only after this wait.
-//   pack waits bar_s[r&1] (S(r)): S(r-2) observed by pack(r-2); S(r+2) needs dK(r) complete,
-//        which needs pack(r) arrived, i.e. every pack thread past this wait.
+//   pack waits bar_s[r&1] (S^T(r)) and then bar_dp[r&1] (dP^T(r)): S(r-2)/dP(r-2) observed by
+//        pack(r-2); S(r+2)/dP(r+2) need dK(r) complete, which needs pack(r) arrived, i.e.
+//        every pack thread past both waits.
 //   prod tests bar_dk[r&1] for dK(r-2) before Q(r): dK(r-4) was observed before Q(r-2); dK(r)
-//        needs Q(r). Tests bar_s[(r-1)&1] for S(r-1) before dO(r): S(r-3) was observed before
-//        dO(r-2); S(r+1) needs dO(r+1), issued after this test.
+//        needs Q(r). Tests bar_dp[(r-1)&1] for dP^T(r-1) before dO(r): dP(r-3) was observed
+//        before dO(r-2); dP(r+1) needs dO(r+1), issued after this test.
 //   The expect_tx of Q(r) opens bar_q[r&1]'s phase only after Q(r-2) was consumed (dK(r-2)
 //   done implies S(r-2) issued after its wait), and that of dO(r) only after dO(r-1) was
 //   consumed (S/dP(r-1) done), so no barrier ever holds two pending expect_tx.
@@ -120,14 +125,21 @@ static_assert(kRoundQueries <= kPackThreads, "one ColumnMeta writer per column")
 inline constexpr int kBarKv = 0;    // K and V landed (once per CTA)
 inline constexpr int kBarQ = 1;     // + (r & 1): Q(r) landed in stage r & 1 (TMA, expect_tx)
 inline constexpr int kBarG = 3;     // dO(r) landed (TMA, expect_tx), single stage
-inline constexpr int kBarS = 4;     // + (r & 1): S^T(r) and dP^T(r) complete (one commit)
+inline constexpr int kBarS = 4;     // + (r & 1): S^T(r) complete (its own commit)
 inline constexpr int kBarDk = 6;    // + (r & 1): dK(r) complete (tcgen05.commit)
 inline constexpr int kBarPack = 8;  // + (r & 1): dS^T(r) packed (kPackThreads arrivals)
-inline constexpr int kBarCount = 10;
+inline constexpr int kBarDp = 10;   // + (r & 1): dP^T(r) complete (committed after S^T(r))
+inline constexpr int kBarCount = 12;
 
 template <int kD, int kDv>
 struct Plan {
-  static_assert(kD == 256 && kDv == 256, "the pipelined dK leaf is the dK-only M128 leaf at (256,256)");
+  // General by capacity, not by bucket name: dK needs kD <= 256 TMEM columns (asserted
+  // below, kdKCol + kD <= kSCol), and the S^T/dP^T round buffers are sized by kRoundQueries
+  // (64, half a query tile) regardless of kD or kDv. kDv only sets how much V this leaf
+  // stages (kSlabsV below); it carries no TMEM-column requirement of its own.
+  static_assert(kD % 64 == 0 && kDv % 64 == 0 && kD > 0 && kD <= 256 && kDv > 0 && kDv <= 256,
+                "the pipelined dK-only leaf fits every (D, Dv) with D, Dv <= 256, each a "
+                "multiple of 64");
   static constexpr int kSlabsK = kD / 64;                         // 4
   static constexpr int kSlabsV = kDv / 64;                        // 4
   static constexpr int kKeySlabBytes = kKeyRows * 128;            // 16,384
@@ -144,10 +156,20 @@ struct Plan {
   static constexpr int kBarOff = kVOff + kVBytes;                 // 229,376
   static constexpr int kSlotOff = kBarOff + 128;                  // 229,504: 16 barrier slots
   static constexpr int kRedOff = kSlotOff + 16;                   // 229,520
+  // ColumnMeta staged as struct-of-arrays: the key-major pack reads one block
+  // column's lse2/delta/lo/hi/segment for all 64 query columns, so an AoS table
+  // forces a strided 24 B load per column (the DkPipe LDS a profile measured). As SoA
+  // the lse2/delta planes are contiguous floats (vectorizable) and the pack stores
+  // are bank-conflict-free. Same 1,536 bytes as the AoS table.
   static constexpr int kMetaOff = kRedOff + 32;                   // 229,552
-  static constexpr int kMetaBytes =
-      kRoundQueries * static_cast<int>(sizeof(pt::ColumnMeta));  // 1,536
-  static constexpr int kEnd = kMetaOff + kMetaBytes;              // 231,088
+  static constexpr int kLse2Off = kMetaOff;                       // 64 x float
+  static constexpr int kDeltaOff = kLse2Off + kRoundQueries * 4;
+  static constexpr int kLoOff = kDeltaOff + kRoundQueries * 4;
+  static constexpr int kHiOff = kLoOff + kRoundQueries * 4;
+  static constexpr int kSegOff = kHiOff + kRoundQueries * 4;
+  // One int per 32-column block of the round: the block passed pt::BlockIsSuffix.
+  static constexpr int kBlkOff = kSegOff + kRoundQueries * 8;     // 231,088
+  static constexpr int kEnd = kBlkOff + (kRoundQueries / 32) * 4; // 231,096
   static constexpr int kSmemBytes = ((kEnd + 1023) / 1024) * 1024 + 1024;  // 232,448
   // TMEM columns.
   static constexpr int kdKCol = 0;
@@ -172,8 +194,17 @@ struct Plan {
                 "descriptor tile bases must stay 1024-aligned");
   static_assert(kMetaOff % 8 == 0, "the ColumnMeta table must stay 8-aligned");
   static_assert(kRoundSlabBytes / 16 < (1 << 14), "the slab hop must encode in the LBO field");
-  static_assert(kSmemBytes == 232448, "SMEM total, computed in the header comment");
+  // At (256,256) kSmemBytes lands exactly on 232,448 B (the opt-in ceiling), which the
+  // original leaf asserted with ==: any future byte added to this Plan's (256,256) staging
+  // breaks the build there, which is the point. Generalized to every (D, Dv) <= 256 the
+  // total is smaller (fewer K/V/Q/dO bytes staged), so the exact-232448 reading is no longer
+  // a universal truth about this Plan - only a fact about its largest bucket - and the
+  // assert that must hold at every (D, Dv) is the ceiling alone; CanLaunchUmmaBackwardDkPipe
+  // also checks it at run time against the device's actual opt-in limit.
   static_assert(kSmemBytes <= 232448, "the sm_103a opt-in dynamic SMEM ceiling");
+  static_assert(kD != 256 || kDv != 256 || kSmemBytes == 232448,
+                "(256,256) stages the most bytes this Plan ever stages; if this no longer "
+                "holds exactly, something shrank its SMEM use silently");
 };
 
 // TMEM column of the packed dS^T of round buffer `buf`, query step kk (16 queries): the pack
@@ -244,7 +275,12 @@ __global__ void __launch_bounds__(kThreads, 1) BackwardDkPipeKernel(
   const uint32_t bar0 = SmemAddr(smem + Pl::kBarOff);
   uint32_t* const tmem_slot = reinterpret_cast<uint32_t*>(smem + Pl::kSlotOff);
   int32_t* const red = reinterpret_cast<int32_t*>(smem + Pl::kRedOff);
-  pt::ColumnMeta* const smeta = reinterpret_cast<pt::ColumnMeta*>(smem + Pl::kMetaOff);
+  float* const smeta_lse2 = reinterpret_cast<float*>(smem + Pl::kLse2Off);
+  float* const smeta_delta = reinterpret_cast<float*>(smem + Pl::kDeltaOff);
+  int32_t* const smeta_lo = reinterpret_cast<int32_t*>(smem + Pl::kLoOff);
+  int32_t* const smeta_hi = reinterpret_cast<int32_t*>(smem + Pl::kHiOff);
+  int64_t* const smeta_seg = reinterpret_cast<int64_t*>(smem + Pl::kSegOff);
+  int32_t* const smeta_blk = reinterpret_cast<int32_t*>(smem + Pl::kBlkOff);
   const uint32_t bar_kv = bar0 + 8 * kBarKv;
   const uint32_t bar_g = bar0 + 8 * kBarG;
 
@@ -337,7 +373,7 @@ __global__ void __launch_bounds__(kThreads, 1) BackwardDkPipeKernel(
         }
         if (gc.t <= qt_last &&
             (rg == 0 ||
-             dvpipe::MbarTestWait(bar0 + 8 * (kBarS + ((rg - 1) & 1)), ((rg - 1) >> 1) & 1))) {
+             dvpipe::MbarTestWait(bar0 + 8 * (kBarDp + ((rg - 1) & 1)), ((rg - 1) >> 1) & 1))) {
           const int hq = static_cast<int>(hk * p.group + gc.gh);
           const int i0 = static_cast<int>(gc.t * kBwdQueryRows + gc.h * kRoundQueries);
           MbarArriveExpectTx(bar_g, Pl::kGBytes);
@@ -370,9 +406,10 @@ __global__ void __launch_bounds__(kThreads, 1) BackwardDkPipeKernel(
       const uint32_t s_idesc = MakeInstrDesc(elem_fmt, kKeyRows, kRoundQueries, /*a=*/0, /*b=*/0);
       const uint32_t k_idesc = MakeInstrDesc(elem_fmt, kKeyRows, kD, /*a=*/0, /*b=*/1);
       // S^T = K Q^T and dP^T = V dO^T into buffer r & 1 (the fused leaf's k-loops, N = 64).
-      auto issue_sdp = [&](uint32_t r) {
+      auto issue_sdp = [&](uint32_t r, int parts = 3) {
         const uint32_t buf = r & 1;
         const uint32_t qs = SmemAddr(sq) + buf * Pl::kQStageBytes;
+        if (parts & 1) {
         for (int kk = 0; kk < kD / 16; ++kk) {
           const int slab = kk >> 2, within = kk & 3;
           MmaSs(tbase + Pl::kSCol + buf * Pl::kBufCols,
@@ -380,6 +417,10 @@ __global__ void __launch_bounds__(kThreads, 1) BackwardDkPipeKernel(
                 MakeSmemDesc(qs + slab * Pl::kRoundSlabBytes + within * 32), s_idesc,
                 kk == 0 ? 0u : 1u);
         }
+        // S^T(r) is published on its own, so the pack computes P^T under dP^T(r).
+        MmaCommit(bar0 + 8 * (kBarS + buf));
+        }
+        if (!(parts & 2)) return;
         for (int kk = 0; kk < kDv / 16; ++kk) {
           const int slab = kk >> 2, within = kk & 3;
           MmaSs(tbase + Pl::kdPCol + buf * Pl::kBufCols,
@@ -387,7 +428,7 @@ __global__ void __launch_bounds__(kThreads, 1) BackwardDkPipeKernel(
                 MakeSmemDesc(SmemAddr(sg) + slab * Pl::kRoundSlabBytes + within * 32), s_idesc,
                 kk == 0 ? 0u : 1u);
         }
-        MmaCommit(bar0 + 8 * (kBarS + buf));
+        MmaCommit(bar0 + 8 * (kBarDp + buf));
       };
       // dK += dS^T Q: one N = 256 instruction per 16-query step (the fused leaf's wide form),
       // B = Q(r) MN-major with the 64-row image's slab hop as LBO.
@@ -407,26 +448,33 @@ __global__ void __launch_bounds__(kThreads, 1) BackwardDkPipeKernel(
       TmemFenceAfterSync();
       __syncwarp();
       issue_sdp(0u);
+      // S^T(r+1) is issued BEFORE the wait for pack(r): its S^T buffer was last read by
+      // pack(r-1), already observed here, and its Q stage holds Q(r+1) once bar_q says so. The
+      // tensor pipe runs it under pack(r)'s chain instead of idling from dP^T(r)'s end to dK(r).
+      // dK(r) follows pack(r), and dP^T(r+1) follows dK(r): its dP^T buffer holds dS^T(r-1)
+      // until dK(r-1) completes, and dO(r+1) lands only after dP^T(r). Only S^T's 16 MMAs go
+      // ahead of dK(r) (an earlier order put all 32 there and dK(r) queued behind them). The MMAs, their
+      // operands and dK's accumulation order are unchanged, so dK is bit-identical.
       for (;;) {
         Round n = c;
         NextRound(p, b, kb, ke, qt_last, &n);
         const bool more = n.t <= qt_last;
         if (more) {
-          // S^T/dP^T(r+1) into buffers (r+1)&1: Q(r+1) and dO(r+1) landed, and the last reader
-          // of those buffers and of that Q stage - the dK MMA of round r-1 - has completed.
           MbarWait(bar0 + 8 * (kBarQ + ((r + 1) & 1)), ((r + 1) >> 1) & 1);
-          MbarWait(bar_g, (r + 1) & 1);
-          if (r >= 1) MbarWait(bar0 + 8 * (kBarDk + ((r - 1) & 1)), ((r - 1) >> 1) & 1);
           TmemFenceAfterSync();
           __syncwarp();
-          issue_sdp(r + 1);
+          issue_sdp(r + 1, 1);
         }
-        // dK(r) += dS^T(r) Q(r): dS^T(r) packed.
         MbarWait(bar0 + 8 * (kBarPack + (r & 1)), (r >> 1) & 1);
         TmemFenceAfterSync();
         __syncwarp();
         issue_dk(r);
         if (!more) break;
+        MbarWait(bar_g, (r + 1) & 1);
+        if (r >= 1) MbarWait(bar0 + 8 * (kBarDk + ((r - 1) & 1)), ((r - 1) >> 1) & 1);
+        TmemFenceAfterSync();
+        __syncwarp();
+        issue_sdp(r + 1, 2);
         c = n;
         ++r;
       }
@@ -440,6 +488,14 @@ __global__ void __launch_bounds__(kThreads, 1) BackwardDkPipeKernel(
     const int64_t j = kb + row_in_tile;
     // The fused leaf's kseg entry of this row, kept in a register (the row never changes).
     const int64_t ks = (seg && j < nt_total) ? p.k_segment[b * nt_total + j] : 0;
+    // Precondition of the suffix-mask path, and it is not the analytic-bounds test alone:
+    // the visible set of key row j is a suffix of a 32-column block only if no chunk boundary
+    // falls inside the block. A block's query positions are p = i + (total_length - q_length),
+    // so that holds when the chunk and that shift are both multiples of the block. Nothing in
+    // the API requires it (the contract runs chunk sizes 1..257), so it is tested here, once
+    // per launch, and any other shape takes the general masked path below.
+    const bool suffix_ok = !seg && p.row_lo == nullptr && p.chunk % pt::kBlock == 0 &&
+        (p.total_length - p.q_length) % pt::kBlock == 0;
     bool any = false;
     uint32_t r = 0;
     Round c;
@@ -453,11 +509,22 @@ __global__ void __launch_bounds__(kThreads, 1) BackwardDkPipeKernel(
     while (c.t <= qt_last) {
       Round n = c;
       NextRound(p, b, kb, ke, qt_last, &n);
-      const bool full = FullTileExact(c.m, p, b, kb, ke);
+      // FullTileExact(c.m, p, b, kb, ke) with its segment test hoisted: `seg` is the same
+      // detail::SegmentTest(p, b), computed once per CTA.
+      const bool full = !seg && FullTile(c.m, kb, ke);
       const uint32_t buf = r & 1;
       // smeta(r) replaces smeta(r-1) only after every pack thread has finished reading it.
       dvpipe::PackBarrierSync();
-      if (tid < kRoundQueries) smeta[tid] = cm;
+      if (tid < kRoundQueries) {
+        smeta_lse2[tid] = cm.lse2;
+        smeta_delta[tid] = cm.delta;
+        smeta_lo[tid] = cm.lo;
+        smeta_hi[tid] = cm.hi;
+        smeta_seg[tid] = cm.segment;
+        // Warps 0 and 1 hold the round's two 32-column blocks, one column per lane.
+        const bool blk_ok = pt::BlockIsSuffix(cm.lo, cm.hi, cm.segment, seg);
+        if (lane == 0) smeta_blk[tid >> 5] = blk_ok ? 1 : 0;
+      }
       dvpipe::PackBarrierSync();
       // Round r+1's gathers, one round ahead (consumed at the next round's staging).
       if (n.t <= qt_last && tid < kRoundQueries) {
@@ -466,17 +533,58 @@ __global__ void __launch_bounds__(kThreads, 1) BackwardDkPipeKernel(
       }
       MbarWait(bar0 + 8 * (kBarS + buf), (r >> 1) & 1);
       TmemFenceAfterSync();
-      // The fused leaf's per-element line on this thread's key row and 32 query columns.
+      // The fused leaf's per-element line on this thread's key row and 32 query columns, in
+      // two phases. S^T(r) is committed before dP^T(r), so P^T = exp2(S^T scale - lse2) and
+      // its mask are computed while the tensor pipe still runs dP^T(r); only
+      // dS^T = P^T (dP^T - delta), its convert and the store wait for dP^T. Per element the
+      // expressions, operands and mask are those of MakePtBlock{FullSoA,Suffix,SoA}
+      // (ProbabilityX2 / ScoreGradientX2 with the same ok bits), so dK is bit-identical.
       const int c0 = ch * pt::kBlock;
-      float s[pt::kBlock], dp[pt::kBlock];
+      float s[pt::kBlock];
       TmemLoad32(lane_base | (tbase + Pl::kSCol + buf * Pl::kBufCols + c0), s);
+      uint32_t mask;
+      if (full) {
+        mask = ~0u;
+      } else if (suffix_ok || smeta_blk[ch] != 0) {
+        // The visible columns of this key row are a suffix of the 32-column block (lo
+        // constant, hi slope 1, one segment - see pt::SuffixMask, pt::BlockIsSuffix): for
+        // the whole launch by the analytic guard, or for this block by its staged metadata.
+        // Two scalars and a shift in place of the per-column compares.
+        mask = pt::BlockSuffixMask(j, smeta_hi[c0], smeta_lo[c0], smeta_seg[c0], ks, seg,
+                                   pt::kBlock);
+      } else {
+        mask = 0u;
+#pragma unroll
+        for (int x = 0; x < pt::kBlock; ++x) {
+          if (pt::VisibleSoA(smeta_lo[c0 + x], smeta_hi[c0 + x], smeta_seg[c0 + x], j, ks, seg)) {
+            mask |= 1u << x;
+          }
+        }
+      }
+      TmemWaitLd();
+#pragma unroll
+      for (int t = 0; t < pt::kBlock / 2; ++t) {
+        const int x = 2 * t;
+        const float2 pp = pt::ProbabilityX2(make_float2(s[x], s[x + 1]),
+                                            make_float2(smeta_lse2[c0 + x], smeta_lse2[c0 + x + 1]),
+                                            p.scale_log2, (mask >> x) & 1u, (mask >> (x + 1)) & 1u);
+        s[x] = pp.x;
+        s[x + 1] = pp.y;
+      }
+      MbarWait(bar0 + 8 * (kBarDp + buf), (r >> 1) & 1);
+      TmemFenceAfterSync();
+      float dp[pt::kBlock];
       TmemLoad32(lane_base | (tbase + Pl::kdPCol + buf * Pl::kBufCols + c0), dp);
       TmemWaitLd();
-      uint32_t pv[pt::kBlock / 2], dsv[pt::kBlock / 2];
-      if (full) {
-        pt::MakePtBlockFull<E, pt::kBlock>(s, dp, &smeta[c0], p.scale_log2, pv, dsv);
-      } else {
-        pt::MakePtBlock<E, pt::kBlock>(s, dp, &smeta[c0], j, ks, seg, p.scale_log2, pv, dsv);
+      uint32_t dsv[pt::kBlock / 2];
+#pragma unroll
+      for (int t = 0; t < pt::kBlock / 2; ++t) {
+        const int x = 2 * t;
+        const float2 ds = pt::ScoreGradientX2(make_float2(s[x], s[x + 1]),
+                                              make_float2(dp[x], dp[x + 1]),
+                                              make_float2(smeta_delta[c0 + x], smeta_delta[c0 + x + 1]),
+                                              (mask >> x) & 1u, (mask >> (x + 1)) & 1u);
+        dsv[t] = pt::Pack2Fast<E>::Of(ds.x, ds.y);
       }
       // In place over this warp's own (already loaded) dP^T columns.
       TmemStore16(lane_base | (tbase + Pl::kdPCol + buf * Pl::kBufCols + c0), dsv);
@@ -496,7 +604,12 @@ __global__ void __launch_bounds__(kThreads, 1) BackwardDkPipeKernel(
       MbarWait(bar0 + 8 * (kBarDk + ((r - 1) & 1)), ((r - 1) >> 1) & 1);
       TmemFenceAfterSync();
     }
-    const int cols = kD > kDv ? kD : kDv;
+    // This leaf writes dK only, whose accumulator holds exactly kD TMEM columns
+    // (kdKCol..kdKCol+kD-1): at kD != kDv (the unequal buckets) using max(kD, kDv) here
+    // read columns past the accumulator (still inside the kSCol/kdPCol windows' allocation,
+    // so no fault, but wasted TMEM traffic and iterations StoreKeyGrad32's width bound
+    // below discarded anyway) instead of the dK width alone.
+    const int cols = kD;
     const int64_t width = p.qk_dim;
     const float mul = p.scale;
     void* row_out = nullptr;
@@ -532,13 +645,14 @@ __global__ void __launch_bounds__(kThreads, 1) BackwardDkPipeKernel(
 }  // namespace dkpipe
 
 // Preflight of the pipelined dK-only leaf (declared in umma_bwd_dkdv.cuh, instantiated for BF16
-// and FP16 in instantiations/sca_umma_bwd_dkdv_d256_v256.cu): the fused leaf's refusal set keyed
-// on the dK output (Accepted with kWrite 1 at the 128-row tile), the (256,256) bucket and real
+// and FP16 at every (D, Dv) the pair serves: (256,256) in
+// instantiations/sca_umma_bwd_dkdv_d256_v256.cu, the four unequal buckets in
+// instantiations/sca_umma_bwd_dkdv_pair_d*.cu): the fused leaf's refusal set keyed on the dK
+// output (Accepted with kWrite 1 at the 128-row tile), the (kD, kDv) bucket and real
 // dimensions, the element, device 10.3, and this plan's dynamic SMEM. `false` means nothing was
 // written; after it every driver error raises, exactly like UmmaBackwardDkdvCanLaunch.
-template <typename E>
+template <typename E, int kD, int kDv>
 bool CanLaunchUmmaBackwardDkPipe(const UmmaLaunchParams& lp) {
-  constexpr int kD = 256, kDv = 256;
   using Pl = dkpipe::Plan<kD, kDv>;
   const Params& p = lp.params;
   if (!Accepted(lp, 1, dkpipe::kKeyRows)) return false;
@@ -565,12 +679,11 @@ bool CanLaunchUmmaBackwardDkPipe(const UmmaLaunchParams& lp) {
 
 // Launch entry of the pipelined dK-only leaf. Writes dK and dPrevK only (every row of every key
 // tile, exact zeros for a tile no query sees); dV and dPrevV are left untouched.
-template <typename E>
+template <typename E, int kD, int kDv>
 bool LaunchUmmaBackwardDkPipe(const UmmaLaunchParams& lp, cudaStream_t stream) {
-  constexpr int kD = 256, kDv = 256;
   using Pl = dkpipe::Plan<kD, kDv>;
   const Params& p = lp.params;
-  if (!CanLaunchUmmaBackwardDkPipe<E>(lp)) return false;
+  if (!CanLaunchUmmaBackwardDkPipe<E, kD, kDv>(lp)) return false;
   const auto kernel = p.key_grads_fp32 ? dkpipe::BackwardDkPipeKernel<E, kD, kDv, true>
                                        : dkpipe::BackwardDkPipeKernel<E, kD, kDv, false>;
   const cudaError_t attr =

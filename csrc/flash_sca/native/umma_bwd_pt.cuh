@@ -178,6 +178,124 @@ struct Pack2<__half> {
   }
 };
 
+// ---------------------------------------------------------------- fast core
+//
+// The instruction budget, not the shared traffic or the bank conflicts, is what
+// binds the D=256 key leaves: DkPipe issues 0.73 warp instructions
+// per visible pair against the reference's 0.31. Two of those instructions per
+// element are avoidable without touching a single value the contract tolerates:
+//
+//   * two scalar round-to-nearest converts per pair lower to two `cvt`; the
+//     packed `cvt.rn.bf16x2/f16x2` is one per pair, and it is the SAME
+//     round-to-nearest-even, low element in the low 16 bits: Pack2Fast::Of(a,b)
+//     is bit-identical to Pack2<Elem>::Of(a,b). This part changes no value.
+//
+// A faster exponential is here as well: `ex2.approx.ftz.f32` replaces `exp2f`'s
+// per-element denormal guard. That is a value change in the subnormal tail (P below
+// 2^-126), which BF16 partially preserves and an FP32 dS can lift back to normal - a tiny
+// difference judged by the frozen contract's FP64 tolerances, which have accepted it at
+// (128,128) and in every dQ bucket. See FastExp2 below for why an earlier
+// contract failure was the unguarded suffix mask and not this.
+//
+// Both live here so every key-leaf caller (DkPipe, DvPipe, KvPipe, the TMEM key
+// leaf) shares one definition instead of one per file.
+// The elementwise exponent.
+//
+// `exp2f` compiles to `MUFU.EX2` plus a per-element denormal guard (des-query-1's SASS
+// reading), so `ex2.approx.ftz.f32` on the same argument is the same instruction
+// without that guard. It is a VALUE CHANGE, in the subnormal tail only: P differs where
+// the result falls below 2^-126. That is not 'zero either way' - FP16's convert flushes
+// those to zero, but BF16 keeps subnormals down to 2^-133, and dS = P*(dP-delta) is formed
+// in FP32, so a |dP-delta| above 1 can lift such a P back to a normal FP32 dS. The
+// magnitude is tiny, and what judges it is the frozen contract's FP64 tolerances, which
+// have accepted it at (128,128) and in every dQ bucket including (256,256).
+// A two-arm build of the KvPipe pack puts the instruction alone at -7.9..-12.1% on
+// four rows and -6.8..-16.8% on nine.
+//
+// An earlier revision carried it; that revision's contract run failed 246 cases, and those were
+// the UNGUARDED SUFFIX MASK, not the exponent: an error of ~2^-22
+// relative cannot reach 1.5e-3 at sequence length 7, and `inf` relative differences mean a
+// masked element came out nonzero, which a guardless MUFU.EX2 cannot produce. So it is
+// here, and it is the only value change in this change set.
+__host__ __device__ __forceinline__ float FastExp2(float x) {
+  float r;
+  asm("ex2.approx.ftz.f32 %0, %1;" : "=f"(r) : "f"(x));
+  return r;
+}
+
+template <class Elem>
+struct Pack2Fast;
+template <>
+struct Pack2Fast<__nv_bfloat16> {
+  __host__ __device__ static uint32_t Of(float lo, float hi) {
+    const __nv_bfloat162 v = __float22bfloat162_rn(make_float2(lo, hi));
+    return *reinterpret_cast<const uint32_t*>(&v);
+  }
+};
+template <>
+struct Pack2Fast<__half> {
+  __host__ __device__ static uint32_t Of(float lo, float hi) {
+    const __half2 v = __float22half2_rn(make_float2(lo, hi));
+    return *reinterpret_cast<const uint32_t*>(&v);
+  }
+};
+
+// ---------------------------------------------------------------- packed f32x2
+//
+// The pack builds four independent floats per pair - `fma(s, scale, -lse2)` twice, then
+// `dp - delta` twice, then `p * (...)` twice - and on sm_100 each of those has a packed
+// two-lane form. `fma/mul/sub .rn.f32x2` are IEEE round-to-nearest-even PER LANE, the same
+// rounding, the same operands and the same order as the scalar forms they replace, so this
+// changes no value at all: it is one instruction where there were two.
+//
+// What a profile of these leaves measures is exactly this arithmetic: DkPipe at 0.9B runs
+// 15.5 fp32 instructions per visible pair against the reference's 5.3, and fp32 is 81% of
+// its excess over the reference. Three of the pair's four fp32 chains halve.
+//
+// The exponential stays scalar: there is no packed exponential, so `FastExp2` is applied
+// per lane and the packed forms cover the fma, the subtract and the multiply.
+__device__ __forceinline__ float2 FmaX2(float2 a, float2 b, float2 c) {
+  unsigned long long pa = *reinterpret_cast<unsigned long long*>(&a);
+  unsigned long long pb = *reinterpret_cast<unsigned long long*>(&b);
+  unsigned long long pc = *reinterpret_cast<unsigned long long*>(&c);
+  unsigned long long pr;
+  asm("fma.rn.f32x2 %0, %1, %2, %3;" : "=l"(pr) : "l"(pa), "l"(pb), "l"(pc));
+  return *reinterpret_cast<float2*>(&pr);
+}
+__device__ __forceinline__ float2 MulX2(float2 a, float2 b) {
+  unsigned long long pa = *reinterpret_cast<unsigned long long*>(&a);
+  unsigned long long pb = *reinterpret_cast<unsigned long long*>(&b);
+  unsigned long long pr;
+  asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(pr) : "l"(pa), "l"(pb));
+  return *reinterpret_cast<float2*>(&pr);
+}
+__device__ __forceinline__ float2 SubX2(float2 a, float2 b) {
+  unsigned long long pa = *reinterpret_cast<unsigned long long*>(&a);
+  unsigned long long pb = *reinterpret_cast<unsigned long long*>(&b);
+  unsigned long long pr;
+  asm("sub.rn.f32x2 %0, %1, %2;" : "=l"(pr) : "l"(pa), "l"(pb));
+  return *reinterpret_cast<float2*>(&pr);
+}
+
+// p = visible && isfinite(lse2) ? exp2(fma(s, scale, -lse2)) : 0, two columns at once.
+__device__ __forceinline__ float2 ProbabilityX2(float2 s, float2 lse2, float scale_log2, bool ok0,
+                                                bool ok1) {
+  const float2 e = FmaX2(s, make_float2(scale_log2, scale_log2), make_float2(-lse2.x, -lse2.y));
+  float2 p = make_float2(FastExp2(e.x), FastExp2(e.y));
+  if (!ok0 || !isfinite(lse2.x)) p.x = 0.f;
+  if (!ok1 || !isfinite(lse2.y)) p.y = 0.f;
+  return p;
+}
+
+// dS pair = p * (dp - delta), masked per lane. Pack with Pack2Fast afterwards.
+__device__ __forceinline__ float2 ScoreGradientX2(float2 p, float2 dp, float2 delta, bool ok0,
+                                                  bool ok1) {
+  float2 v = MulX2(p, SubX2(dp, delta));
+  if (!ok0) v.x = 0.f;
+  if (!ok1) v.y = 0.f;
+  return v;
+}
+
 // The elementwise step for one key row and one block of query columns.
 // `j` is the GLOBAL key index of this row, `key_segment` its k_segment (ignored
 // when !segments), `meta` points at the block's first column.
@@ -225,6 +343,283 @@ __host__ __device__ __forceinline__ void MakePtBlockFull(const float (&s)[kCols]
     out_p[t] = Pack2<Elem>::Of(p0, p1);
     out_ds[t] = Pack2<Elem>::Of(ScoreGradient(p0, dp[c0], meta[c0], true),
                                 ScoreGradient(p1, dp[c0 + 1], meta[c0 + 1], true));
+  }
+}
+
+// ---------------------------------------------------------------- SoA column meta
+//
+// The same elementwise step and result as MakePtBlock{,Full}, but the per-column
+// inputs are read from STRUCT-OF-ARRAYS planes instead of an array of 24-byte
+// ColumnMeta. The pipelined dK key leaf (umma_bwd_dk_pipe.cuh) is key-major: each
+// pack thread owns one key row and must read the metadata of all of the block's
+// QUERY columns, so with the AoS table it issues a strided 24 B load per column
+// (the 194.8M LDS a profile measured on DkPipe). With SoA the block's lse2/delta are
+// contiguous floats, so the same reads vectorize and the pack stores are
+// bank-conflict-free. The arithmetic is IDENTICAL to Probability/ScoreGradient/
+// Visible - the two paths agree bit for bit; only the gather layout differs.
+
+__host__ __device__ __forceinline__ bool VisibleSoA(int32_t lo, int32_t hi, int64_t seg, int64_t j,
+                                                    int64_t key_segment, bool segments) {
+  if (j < static_cast<int64_t>(lo) || j > static_cast<int64_t>(hi)) return false;
+  if (segments && key_segment != seg) return false;
+  return true;
+}
+
+__host__ __device__ __forceinline__ float ProbabilitySoA(float s, float lse2v, float scale_log2,
+                                                         bool visible) {
+  const float v = FastExp2(fmaf(s, scale_log2, -lse2v));
+  return (visible && isfinite(lse2v)) ? v : 0.f;
+}
+
+// dS^T only (the dK leaf never consumes P^T, so the packed-P write is dropped):
+// out_ds[t] = two packed dS^T of columns (2t, 2t+1), element 2t low.
+template <class Elem, int kCols = kBlock>
+__host__ __device__ __forceinline__ void MakePtBlockSoA(const float (&s)[kCols],
+                                                        const float (&dp)[kCols],
+                                                        const float* lse2, const float* delta,
+                                                        const int32_t* lo, const int32_t* hi,
+                                                        const int64_t* seg, int64_t j,
+                                                        int64_t key_segment, bool segments,
+                                                        float scale_log2, uint32_t* out_ds) {
+  static_assert(kCols % 2 == 0, "pairs");
+#pragma unroll
+  for (int t = 0; t < kCols / 2; ++t) {
+    const int c0 = 2 * t;
+    const bool ok0 = VisibleSoA(lo[c0], hi[c0], seg[c0], j, key_segment, segments);
+    const bool ok1 = VisibleSoA(lo[c0 + 1], hi[c0 + 1], seg[c0 + 1], j, key_segment, segments);
+    const float2 p = ProbabilityX2(make_float2(s[c0], s[c0 + 1]),
+                                   make_float2(lse2[c0], lse2[c0 + 1]), scale_log2, ok0, ok1);
+    const float2 ds = ScoreGradientX2(p, make_float2(dp[c0], dp[c0 + 1]),
+                                      make_float2(delta[c0], delta[c0 + 1]), ok0, ok1);
+    out_ds[t] = Pack2Fast<Elem>::Of(ds.x, ds.y);
+  }
+}
+
+// Same, for a block PROVED fully visible with no segment test (FullTileExact):
+// needs only lse2 and delta, so it skips the lo/hi/segment plane reads entirely.
+template <class Elem, int kCols = kBlock>
+__host__ __device__ __forceinline__ void MakePtBlockFullSoA(const float (&s)[kCols],
+                                                            const float (&dp)[kCols],
+                                                            const float* lse2, const float* delta,
+                                                            float scale_log2, uint32_t* out_ds) {
+  static_assert(kCols % 2 == 0, "pairs");
+#pragma unroll
+  for (int t = 0; t < kCols / 2; ++t) {
+    const int c0 = 2 * t;
+    const float2 p = ProbabilityX2(make_float2(s[c0], s[c0 + 1]),
+                                   make_float2(lse2[c0], lse2[c0 + 1]), scale_log2, true, true);
+    const float2 ds = ScoreGradientX2(p, make_float2(dp[c0], dp[c0 + 1]),
+                                      make_float2(delta[c0], delta[c0 + 1]), true, true);
+    out_ds[t] = Pack2Fast<Elem>::Of(ds.x, ds.y);
+  }
+}
+
+// ---------------------------------------------------------------- suffix mask
+//
+// The dS^T-only pack for a key-major block whose bounds are the ANALYTIC interval
+// (p.row_lo == nullptr), whose batch row needs no segment test, and whose block cannot
+// straddle a chunk boundary - the caller checks that with `chunk % kCols == 0` and
+// `(total_length - q_length) % kCols == 0`, since the block's positions are
+// p = i + (total_length - q_length) and the contract's chunk sizes run 1..257. Given
+// that alignment, the visible columns of a key row j are a SUFFIX of the block: `lo` is
+// constant inside it and `hi(c) = hi(c0) + c` has slope exactly 1 (visibility.cuh
+// RowBounds: hi = i + total - q - strict). So the mask is one scalar shift -
+// `~0u << clamp(j - hi(c0), 0, kCols)` - and empty when j < lo(c0), in place of a 24 B
+// per-column gather plus two compares and a select each.
+// The per-element arithmetic is ProbabilityX2/ScoreGradientX2 over the same operands in
+// the same order, so the values equal the scalar SoA path's except for the exponential,
+// which is the one value change in this change set (FastExp2, see above). A block that
+// fails either guard (explicit bounds, or a segment test) uses MakePtBlockSoA with the
+// same core, so no caller loses the packed-convert/f32x2 win.
+__host__ __device__ __forceinline__ uint32_t SuffixMask(int64_t j, int32_t hi_c0, int32_t lo_c0,
+                                                        int kCols) {
+  if (j < static_cast<int64_t>(lo_c0)) return 0u;
+  const int64_t sh = j - static_cast<int64_t>(hi_c0);
+  if (sh <= 0) return ~0u;
+  if (sh >= kCols) return 0u;
+  return ~0u << static_cast<unsigned>(sh);
+}
+
+// Per-block form of the suffix guard, for explicit row bounds and segments. A
+// 32-column block whose columns all have the SAME lo, hi(c) = hi(c0) + c, and (when the
+// batch row tests segments) the same query segment has, for every key row j, the visible
+// set {c : lo <= j <= hi(c0) + c, key_segment(j) == segment} - the suffix SuffixMask
+// builds, or empty when the key's segment differs. That is the exact per-column rule
+// (Visible/VisibleSoA), so the values are the general path's bit for bit; the test is on
+// the staged metadata itself, not on how it was produced, so it holds for analytic bounds,
+// BOS row bounds, previous K/V and any chunk. Blocks that straddle a row (document) start,
+// a chunk boundary or the end of the query axis fail it and keep the general path.
+// Warp-collective: lane L passes column c0 + L's lo/hi/segment; every lane gets the answer.
+#ifdef __CUDACC__
+__device__ __forceinline__ bool BlockIsSuffix(int32_t lo, int32_t hi, int64_t segment,
+                                              bool segments) {
+  const int lane = static_cast<int>(threadIdx.x & 31u);
+  const int32_t lo0 = __shfl_sync(0xffffffffu, lo, 0);
+  const int32_t hi0 = __shfl_sync(0xffffffffu, hi, 0);
+  const long long s0 = __shfl_sync(0xffffffffu, static_cast<long long>(segment), 0);
+  const bool ok = lo == lo0 && static_cast<int64_t>(hi) == static_cast<int64_t>(hi0) + lane &&
+                  (!segments || static_cast<long long>(segment) == s0);
+  return __all_sync(0xffffffffu, ok) != 0;
+}
+#endif
+
+// The visible mask of key row j in a block that passed BlockIsSuffix.
+__host__ __device__ __forceinline__ uint32_t BlockSuffixMask(int64_t j, int32_t hi_c0,
+                                                             int32_t lo_c0, int64_t seg_c0,
+                                                             int64_t key_segment, bool segments,
+                                                             int kCols) {
+  if (segments && key_segment != seg_c0) return 0u;
+  return SuffixMask(j, hi_c0, lo_c0, kCols);
+}
+
+template <class Elem, int kCols = kBlock>
+__host__ __device__ __forceinline__ void MakePtBlockSuffix(const float (&s)[kCols],
+                                                           const float (&dp)[kCols],
+                                                           const float* lse2, const float* delta,
+                                                           uint32_t mask, float scale_log2,
+                                                           uint32_t* out_ds) {
+  static_assert(kCols % 2 == 0, "pairs");
+#pragma unroll
+  for (int t = 0; t < kCols / 2; ++t) {
+    const int c0 = 2 * t;
+    const bool ok0 = (mask >> c0) & 1u;
+    const bool ok1 = (mask >> (c0 + 1)) & 1u;
+    const float2 p = ProbabilityX2(make_float2(s[c0], s[c0 + 1]),
+                                   make_float2(lse2[c0], lse2[c0 + 1]), scale_log2, ok0, ok1);
+    const float2 ds = ScoreGradientX2(p, make_float2(dp[c0], dp[c0 + 1]),
+                                      make_float2(delta[c0], delta[c0 + 1]), ok0, ok1);
+    out_ds[t] = Pack2Fast<Elem>::Of(ds.x, ds.y);
+  }
+}
+
+// ---------------------------------------------------------------- dV leaf (P^T only)
+//
+// The dV-only leaf (umma_bwd_dv_pipe.cuh) packs P^T and nothing else: dV += P^T dO,
+// and its dS^T output is never stored. So its pack computes only the probability,
+// through the same fast core, and skips the dS arithmetic and the second convert
+// entirely. Same layout and lane mapping as the dS packs above, AoS ColumnMeta so
+// the caller's existing smeta staging is unchanged.
+template <class Elem, int kCols = kBlock>
+__host__ __device__ __forceinline__ void MakePtBlockFullP(const float (&s)[kCols],
+                                                          const ColumnMeta* meta, float scale_log2,
+                                                          uint32_t* out_p) {
+  static_assert(kCols % 2 == 0, "pairs");
+#pragma unroll
+  for (int t = 0; t < kCols / 2; ++t) {
+    const int c0 = 2 * t;
+    const float2 p = ProbabilityX2(make_float2(s[c0], s[c0 + 1]),
+                                   make_float2(meta[c0].lse2, meta[c0 + 1].lse2), scale_log2, true,
+                                   true);
+    out_p[t] = Pack2Fast<Elem>::Of(p.x, p.y);
+  }
+}
+
+template <class Elem, int kCols = kBlock>
+__host__ __device__ __forceinline__ void MakePtBlockSuffixP(const float (&s)[kCols],
+                                                            const ColumnMeta* meta, uint32_t mask,
+                                                            float scale_log2, uint32_t* out_p) {
+  static_assert(kCols % 2 == 0, "pairs");
+#pragma unroll
+  for (int t = 0; t < kCols / 2; ++t) {
+    const int c0 = 2 * t;
+    const bool ok0 = (mask >> c0) & 1u;
+    const bool ok1 = (mask >> (c0 + 1)) & 1u;
+    const float2 p = ProbabilityX2(make_float2(s[c0], s[c0 + 1]),
+                                   make_float2(meta[c0].lse2, meta[c0 + 1].lse2), scale_log2, ok0,
+                                   ok1);
+    out_p[t] = Pack2Fast<Elem>::Of(p.x, p.y);
+  }
+}
+
+template <class Elem, int kCols = kBlock>
+__host__ __device__ __forceinline__ void MakePtBlockFastP(const float (&s)[kCols],
+                                                          const ColumnMeta* meta, int64_t j,
+                                                          int64_t key_segment, bool segments,
+                                                          float scale_log2, uint32_t* out_p) {
+  static_assert(kCols % 2 == 0, "pairs");
+#pragma unroll
+  for (int t = 0; t < kCols / 2; ++t) {
+    const int c0 = 2 * t;
+    const bool ok0 = Visible(meta[c0], j, key_segment, segments);
+    const bool ok1 = Visible(meta[c0 + 1], j, key_segment, segments);
+    const float2 p = ProbabilityX2(make_float2(s[c0], s[c0 + 1]),
+                                   make_float2(meta[c0].lse2, meta[c0 + 1].lse2), scale_log2, ok0,
+                                   ok1);
+    out_p[t] = Pack2Fast<Elem>::Of(p.x, p.y);
+  }
+}
+
+// ---------------------------------------------------------------- dV leaf (P^T only), SoA lse2
+//
+// The same P^T-only values as MakePtBlock{Full,Suffix,Fast}P above, but lse2 is read
+// from a contiguous SoA float plane instead of gathered from the 24-byte AoS ColumnMeta, and
+// the per-element `isfinite(lse2)` select inside Probability/ProbabilityX2 is dropped. Every
+// lse2 this leaf's own staging writes is already ColumnOf's `isfinite(lse) ? lse * kLog2e :
+// INFINITY` (above), i.e. already +inf wherever the row's own lse was not finite, so
+// FastExp2(-inf) alone already returns exactly 0.f (ex2.approx.ftz(-inf) = +0, no NaN): the
+// select decided nothing an already-+inf lse2 did not decide for it. This is the KvPipe
+// mechanism (umma_bwd_kv_pipe.cuh), applied here to the dV-only pack's probability only - the
+// visibility mask (ok0/ok1, from the window and segment test) is UNCHANGED and still zeros
+// every column the contract requires zeroed; only the redundant finite-lse test is gone. The
+// lo/hi/segment plane stays the AoS ColumnMeta (unchanged callers, unchanged suffix-mask path);
+// only the per-column lse2 read moves to the plane, so the gather this replaces is the one
+//32-column loop's worth of strided 24 B loads for the ONE field it actually dereferences.
+__device__ __forceinline__ float2 ProbabilityX2Fast(float2 s, float2 lse2, float scale_log2,
+                                                     bool ok0, bool ok1) {
+  const float2 e = FmaX2(s, make_float2(scale_log2, scale_log2), make_float2(-lse2.x, -lse2.y));
+  float2 p = make_float2(FastExp2(e.x), FastExp2(e.y));
+  if (!ok0) p.x = 0.f;
+  if (!ok1) p.y = 0.f;
+  return p;
+}
+
+template <class Elem, int kCols = kBlock>
+__host__ __device__ __forceinline__ void MakePtBlockFullPSoA(const float (&s)[kCols],
+                                                              const float* lse2, float scale_log2,
+                                                              uint32_t* out_p) {
+  static_assert(kCols % 2 == 0, "pairs");
+#pragma unroll
+  for (int t = 0; t < kCols / 2; ++t) {
+    const int c0 = 2 * t;
+    const float2 p = ProbabilityX2Fast(make_float2(s[c0], s[c0 + 1]),
+                                       make_float2(lse2[c0], lse2[c0 + 1]), scale_log2, true,
+                                       true);
+    out_p[t] = Pack2Fast<Elem>::Of(p.x, p.y);
+  }
+}
+
+template <class Elem, int kCols = kBlock>
+__host__ __device__ __forceinline__ void MakePtBlockSuffixPSoA(const float (&s)[kCols],
+                                                                const float* lse2, uint32_t mask,
+                                                                float scale_log2,
+                                                                uint32_t* out_p) {
+  static_assert(kCols % 2 == 0, "pairs");
+#pragma unroll
+  for (int t = 0; t < kCols / 2; ++t) {
+    const int c0 = 2 * t;
+    const bool ok0 = (mask >> c0) & 1u;
+    const bool ok1 = (mask >> (c0 + 1)) & 1u;
+    const float2 p = ProbabilityX2Fast(make_float2(s[c0], s[c0 + 1]),
+                                       make_float2(lse2[c0], lse2[c0 + 1]), scale_log2, ok0, ok1);
+    out_p[t] = Pack2Fast<Elem>::Of(p.x, p.y);
+  }
+}
+
+template <class Elem, int kCols = kBlock>
+__host__ __device__ __forceinline__ void MakePtBlockFastPSoA(const float (&s)[kCols],
+                                                              const float* lse2,
+                                                              const ColumnMeta* meta, int64_t j,
+                                                              int64_t key_segment, bool segments,
+                                                              float scale_log2, uint32_t* out_p) {
+  static_assert(kCols % 2 == 0, "pairs");
+#pragma unroll
+  for (int t = 0; t < kCols / 2; ++t) {
+    const int c0 = 2 * t;
+    const bool ok0 = Visible(meta[c0], j, key_segment, segments);
+    const bool ok1 = Visible(meta[c0 + 1], j, key_segment, segments);
+    const float2 p = ProbabilityX2Fast(make_float2(s[c0], s[c0 + 1]),
+                                       make_float2(lse2[c0], lse2[c0 + 1]), scale_log2, ok0, ok1);
+    out_p[t] = Pack2Fast<Elem>::Of(p.x, p.y);
   }
 }
 

@@ -80,16 +80,66 @@ void ForwardCase(const Params& p, cudaStream_t stream) {
 // reduces dQ with atomics), then one fused dK+dV launch. A mask that clears a
 // stage means that stage already ran, in another body; nothing here records a
 // tag for it.
+// One launch for the backward's native preprocessing: delta, the per-64-row
+// query tile bounds and the per-64-key tile range (PreprocessBackwardKernel,
+// kernels.cuh). Grid (row tiles, Hq, B) with kLanes threads per query row, so no
+// per-thread int64 div/mod. The key range needs its own batch's tile bounds; one
+// block per batch computes both in shared memory, so no cross-block dependency
+// and no atomics. A second key-range launch runs only when the tile table is too
+// large for shared memory.
+template <typename E, int kLanes>
+inline void LaunchPreprocess(const Params& p, cudaStream_t stream) {
+  constexpr int kRowsPerBlock = detail::kPreprocessThreads / kLanes;
+  const unsigned row_tiles =
+      static_cast<unsigned>((p.q_length + kRowsPerBlock - 1) / kRowsPerBlock);
+  const dim3 grid(row_tiles, static_cast<unsigned>(p.query_heads),
+                  static_cast<unsigned>(p.batch));
+  if (p.key_tile_range != nullptr && p.tile_count <= detail::kPreprocessMaxTileCount) {
+    const int smem = static_cast<int>(p.tile_count * 4 * sizeof(int));
+    detail::PreprocessBackwardKernel<E, kLanes, true>
+        <<<grid, detail::kPreprocessThreads, smem, stream>>>(p);
+  } else {
+    detail::PreprocessBackwardKernel<E, kLanes, false>
+        <<<grid, detail::kPreprocessThreads, 0, stream>>>(p);
+    if (p.key_tile_range != nullptr) {
+      Params mutable_p = p;
+      LaunchKeyTileRange(mutable_p, stream);  // tile bounds were written above
+    }
+  }
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
 template <typename E>
 void BackwardDeltaStage(const Params& p, cudaStream_t stream) {
-  constexpr int kRowsPerBlock = 8;
   const int64_t rows = p.batch * p.q_length * p.query_heads;
-  detail::DeltaKernel<E><<<static_cast<unsigned>((rows + kRowsPerBlock - 1) / kRowsPerBlock),
-                           kRowsPerBlock * 32, 0, stream>>>(p);
-  C10_CUDA_KERNEL_LAUNCH_CHECK();
-  // DeltaKernel is a scalar warp dot-product/reduction with no T::Mma, so its
-  // body is kScalar, not kMmaSync: labelling it with a tensor-core body would
-  // put a false row in the first phase every backward records.
+  // Vector path: 16-B loads need dy and saved contiguous, 16-B aligned and a
+  // value dim that is a multiple of 8 (every bucket dim is). Otherwise the seed's
+  // scalar delta kernel runs, with the two table kernels beside it.
+  const bool vectorized = rows > 0 && !p.saved_fp32 && p.dy != nullptr && p.saved != nullptr &&
+                          p.delta != nullptr && (p.value_dim % 8) == 0 && p.value_dim >= 8 &&
+                          (reinterpret_cast<unsigned long long>(p.dy) % 16) == 0 &&
+                          (reinterpret_cast<unsigned long long>(p.saved) % 16) == 0;
+  if (vectorized) {
+    const int64_t nvec = p.value_dim >> 3;
+    if (nvec >= 32) {
+      LaunchPreprocess<E, 32>(p, stream);
+    } else if (nvec >= 16) {
+      LaunchPreprocess<E, 16>(p, stream);
+    } else {
+      LaunchPreprocess<E, 8>(p, stream);
+    }
+  } else if (rows > 0) {
+    Params mutable_p = p;
+    LaunchTileBounds(mutable_p, stream);
+    if (p.row_lo != nullptr) LaunchKeyTileRange(mutable_p, stream);
+    constexpr int kRowsPerBlock = 8;
+    detail::DeltaKernel<E><<<static_cast<unsigned>((rows + kRowsPerBlock - 1) / kRowsPerBlock),
+                             kRowsPerBlock * 32, 0, stream>>>(p);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+  }
+  // The delta body is a scalar dot-product/reduction with no T::Mma, so its body
+  // is kScalar: labelling it with a tensor-core body would put a false row in the
+  // first phase every backward records.
   RecordPhase(Phase::kDelta, Body::kScalar, Body::kScalar, State::kRan);
 }
 

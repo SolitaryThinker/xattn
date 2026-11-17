@@ -558,6 +558,101 @@ __global__ void DeltaKernel(const Params p) {
   }
 }
 
+// ------------------------------------------------- backward preprocessing ---
+
+__device__ __forceinline__ float ElemToFloat(__nv_bfloat16 x) { return __bfloat162float(x); }
+__device__ __forceinline__ float ElemToFloat(__half x) { return __half2float(x); }
+
+// The backward's native preprocessing in ONE launch: delta = rowsum(dO*O), the
+// per-64-row query tile bounds, and (when kKeyRangeInBlock) the per-64-key tile
+// range. Grid (ceil(Nq/8), Hq, B) with one warp per query row, so b = blockIdx.z,
+// h = blockIdx.y, i = blockIdx.x*8 + warp: no per-thread int64 div/mod. Block
+// (0,0,b) also computes batch b's tile bounds into shared memory and then its
+// key range from them, so key range has no cross-block dependency and no atomics.
+// delta uses 16-B vector loads (8 elements per lane, Dv/8 lanes) with a fixed
+// summation order; the tile tables are exact min/max reductions, identical to the
+// separate TileBounds/KeyTileRange kernels. The leaves are unchanged.
+constexpr int kPreprocessThreads = 256;
+constexpr int64_t kPreprocessMaxTileCount = 3072;         // tile_count*4 ints <= 48 KB shared
+
+template <typename E, int kLanes, bool kKeyRangeInBlock>
+__global__ void __launch_bounds__(kPreprocessThreads, 8)
+PreprocessBackwardKernel(const Params p) {
+  extern __shared__ int sm[];  // [tile_count][4]; read only when kKeyRangeInBlock
+  constexpr int kRowsPerBlock = kPreprocessThreads / kLanes;
+  const int sub = threadIdx.x % kLanes;          // kLanes is 8, 16 or 32: compile-time
+  const int64_t b = blockIdx.z;
+  const int64_t hq = blockIdx.y;
+
+  // ---- delta for query row i of (b, hq): kLanes threads per row, 16-B loads
+  const int64_t i = int64_t(blockIdx.x) * kRowsPerBlock + (threadIdx.x / kLanes);
+  const bool valid = i < p.q_length;
+  const int64_t ii = valid ? i : int64_t(0);     // dead rows read row 0, skip the store
+  const int64_t base = ((b * p.q_length + ii) * p.query_heads + hq) * p.value_dim;
+  const E* dy = reinterpret_cast<const E*>(p.dy) + base;
+  const E* sv = reinterpret_cast<const E*>(p.saved) + base;
+  float sum = 0.f;
+  for (int64_t c = 8 * sub; c < p.value_dim; c += 8 * kLanes) {
+    union { uint4 u; E e[8]; } a, s;
+    a.u = __ldg(reinterpret_cast<const uint4*>(dy + c));
+    s.u = __ldg(reinterpret_cast<const uint4*>(sv + c));
+#pragma unroll
+    for (int x = 0; x < 8; ++x) sum += ElemToFloat(a.e[x]) * ElemToFloat(s.e[x]);
+  }
+#pragma unroll
+  for (int off = kLanes / 2; off > 0; off /= 2) sum += __shfl_xor_sync(0xffffffffu, sum, off);
+  if (valid && sub == 0) p.delta[(b * p.query_heads + hq) * p.q_length + i] = sum;
+
+  // ---- tile bounds (and key range) for batch b, one block: (0,0,b)
+  if (blockIdx.x == 0 && blockIdx.y == 0 && p.tile_bounds != nullptr) {
+    const int64_t tiles = p.tile_count;
+    for (int64_t t = threadIdx.x; t < tiles; t += kPreprocessThreads) {
+      int min_lo = INT_MAX, max_hi = -1, max_lo = INT_MIN, min_hi = INT_MAX;
+      const int64_t r0 = t * kTileRows;
+      for (int r = 0; r < kTileRows; ++r) {
+        const Bounds bd = RowBounds(p, b, r0 + r);
+        if (bd.lo <= bd.hi) {
+          min_lo = min(min_lo, bd.lo);
+          max_hi = max(max_hi, bd.hi);
+        }
+        max_lo = max(max_lo, bd.lo);
+        min_hi = min(min_hi, bd.hi);
+      }
+      int32_t* dst = p.tile_bounds + (b * tiles + t) * 4;
+      dst[0] = min_lo;
+      dst[1] = max_hi;
+      dst[2] = max_lo;
+      dst[3] = min_hi;
+      if constexpr (kKeyRangeInBlock) {
+        sm[t * 4 + 0] = min_lo;
+        sm[t * 4 + 1] = max_hi;
+        sm[t * 4 + 2] = max_lo;
+        sm[t * 4 + 3] = min_hi;
+      }
+    }
+    if constexpr (kKeyRangeInBlock) {
+      __syncthreads();
+      if (p.key_tile_range != nullptr) {
+        const int64_t keys = p.key_tile_count;
+        for (int64_t n = threadIdx.x; n < keys; n += kPreprocessThreads) {
+          const int64_t n0 = n * kTileRows, n1 = n0 + kTileRows - 1;
+          int first = INT_MAX, last = -1;
+          for (int64_t t = 0; t < tiles; ++t) {
+            const int* e = &sm[t * 4];
+            if (e[0] <= n1 && e[1] >= n0) {
+              first = min(first, static_cast<int>(t));
+              last = max(last, static_cast<int>(t));
+            }
+          }
+          int32_t* dst = p.key_tile_range + (b * keys + n) * 2;
+          dst[0] = first;
+          dst[1] = last;
+        }
+      }
+    }
+  }
+}
+
 __device__ __forceinline__ float LseLog2(float lse) {
   // A non-finite LSE marks a row without admitted keys: every P is zero.
   return isfinite(lse) ? lse * kLog2e : INFINITY;

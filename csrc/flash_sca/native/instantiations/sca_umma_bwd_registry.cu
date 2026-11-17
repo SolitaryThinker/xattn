@@ -42,6 +42,17 @@ bool CanLaunchUmmaBackwardInSituDkdv(const UmmaLaunchParams&);
 template <class E, int D, int V>
 bool LaunchUmmaBackwardInSituDkdv(const UmmaLaunchParams&, cudaStream_t);
 
+// The pipelined buckets' entries (umma_bwd_pipe_small.cuh; instantiated in
+// instantiations/sca_umma_bwd_pipe_d*_v*.cu).
+template <class E, int D, int V>
+bool CanLaunchUmmaDqPipeAt(const UmmaLaunchParams&);
+template <class E, int D, int V>
+bool LaunchUmmaDqPipeAt(const UmmaLaunchParams&, cudaStream_t);
+template <typename E, int D, int V>
+bool CanLaunchUmmaBackwardKvPipeAt(const UmmaLaunchParams&);
+template <typename E, int D, int V>
+bool LaunchUmmaBackwardKvPipeAt(const UmmaLaunchParams&, cudaStream_t);
+
 namespace {
 struct Row {
   BackwardProduct product;
@@ -64,7 +75,41 @@ struct Row {
 #define XATTN_SCA_BUCKET(D, V) \
   XATTN_SCA_ENTRY(Element::kHalf, __half, D, V) \
   XATTN_SCA_ENTRY(Element::kBFloat16, __nv_bfloat16, D, V)
-const Row kEntries[] = {XATTN_SCA_BACKWARD_BUCKETS(XATTN_SCA_BUCKET)};
+// The pipelined buckets (umma_bwd_pipe_small.cuh): the dQ pipe and the fused M128 key pipe,
+// level 0 only, named directly (no fused in-situ body at these buckets).
+#define XATTN_SCA_PIPE_ENTRY(E, T, D, V) \
+  {BackwardProduct::kDq, E, D, V, \
+   {CanLaunchUmmaDqPipeAt<T, D, V>, LaunchUmmaDqPipeAt<T, D, V>, true}}, \
+  {BackwardProduct::kDkdv, E, D, V, \
+   {CanLaunchUmmaBackwardKvPipeAt<T, D, V>, LaunchUmmaBackwardKvPipeAt<T, D, V>, true, 128}},
+#define XATTN_SCA_PIPE_BUCKET(D, V) \
+  XATTN_SCA_PIPE_ENTRY(Element::kHalf, __half, D, V) \
+  XATTN_SCA_PIPE_ENTRY(Element::kBFloat16, __nv_bfloat16, D, V)
+// The four unequal buckets (a dQ entry, then the key row). The key row names the SAME
+// in-situ launch the (256,256)/(128,128) XATTN_SCA_ENTRY rows name
+// (CanLaunchUmmaBackwardInSituDkdv/LaunchUmmaBackwardInSituDkdv): at these buckets its capacity
+// rule (umma_bwd_dkdv.cuh:kDkdvPairFits) selects the dV-only/dK-only M128 pair rather than the
+// fused body (which refuses D + Dv > 256), so a key call here now reaches a native leaf instead
+// of falling through to the generic detail::DkdvKernel body as before. The static key_rows field
+// stays InSituKeyRowsFor(D, V) == 64 (these buckets' fused body, were it ever asked, prefers
+// M64); the pair's actual M128 launch is recorded at run time in InSituLaunchedKeyRows(), the
+// same split BackwardLeafEntry's own comment documents for (128,128) and (256,256).
+#define XATTN_SCA_DQ_PIPE_ENTRY(E, T, D, V) \
+  {BackwardProduct::kDq, E, D, V, \
+   {CanLaunchUmmaDqPipeAt<T, D, V>, LaunchUmmaDqPipeAt<T, D, V>, true}}, \
+  {BackwardProduct::kDkdv, E, D, V, \
+   {CanLaunchUmmaBackwardInSituDkdv<T, D, V>, LaunchUmmaBackwardInSituDkdv<T, D, V>, true, \
+    InSituKeyRowsFor(D, V)}},
+#define XATTN_SCA_DQ_PIPE_BUCKET(D, V) \
+  XATTN_SCA_DQ_PIPE_ENTRY(Element::kHalf, __half, D, V) \
+  XATTN_SCA_DQ_PIPE_ENTRY(Element::kBFloat16, __nv_bfloat16, D, V)
+const Row kEntries[] = {XATTN_SCA_BACKWARD_BUCKETS(XATTN_SCA_BUCKET)
+                            XATTN_SCA_BACKWARD_PIPE_BUCKETS(XATTN_SCA_PIPE_BUCKET)
+                                XATTN_SCA_BACKWARD_DQ_PIPE_BUCKETS(XATTN_SCA_DQ_PIPE_BUCKET)};
+#undef XATTN_SCA_DQ_PIPE_BUCKET
+#undef XATTN_SCA_DQ_PIPE_ENTRY
+#undef XATTN_SCA_PIPE_BUCKET
+#undef XATTN_SCA_PIPE_ENTRY
 #undef XATTN_SCA_BUCKET
 #undef XATTN_SCA_ENTRY
 }  // namespace

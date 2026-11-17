@@ -197,18 +197,37 @@ def _require_one_run_per_segment(q_ids: Tensor, k_ids: Tensor, api_name: str) ->
 @torch.no_grad()
 def visibility(q: Tensor, total: int, chunk_size: int, *, q_segment_idx=None,
                k_segment_idx=None, segment_idx=None, bos_mask=None,
-               reset: bool = False, strict: bool = False) -> Visibility:
-    """Reduce public metadata to the kernels' row bounds and segment planes."""
+               reset: bool = False, strict: bool = False,
+               bos_in_call: bool = True) -> Visibility:
+    """Reduce public metadata to the kernels' row bounds and segment planes.
+
+    A BOS mask has two device routes, which give the same integers: with ``bos_in_call``
+    (the default, the forward's route) the mask itself is the metadata boundary and the
+    extension call derives the bounds from it (``Visibility.bos_mask``); without it (the
+    public backward's route) the bounds come from one ``_flash_sca_row_bounds`` launch here.
+    """
     batch, length = q.shape[0], q.shape[1]
     if bos_mask is not None:
         if any(x is not None for x in (segment_idx, q_segment_idx, k_segment_idx)):
             raise ValueError("BOS masks and segment indices are mutually exclusive")
         _validate_bos(bos_mask, q, total)
-        if not reset and total <= _MASK_MAX_KEYS:
+        if bos_in_call and not reset and total <= _MASK_MAX_KEYS:
             # The bounds come from the mask inside the forward/backward call itself, so the
             # metadata boundary is one Python->C++ call and one launch, with no cumsum, no
             # ids plane and no bool->int64 cast to build (Visibility.bos_mask).
             return Visibility(bos_mask=bos_mask.contiguous())
+        # One launch on the device for the whole reduction: the segment start and
+        # end of every query row are the last BOS at or before it and the first BOS
+        # after it, so the row bounds follow from the mask alone. The same values
+        # in the same dtype as the tensor pipeline below, which stays as the
+        # fallback for a device or build that cannot run the native op.
+        ops = _extension_ops()
+        if (not bos_in_call and q.is_cuda and ops is not None
+                and hasattr(ops, "_flash_sca_row_bounds")):
+            if ops._flash_sca_native_available(q):
+                lo, hi = ops._flash_sca_row_bounds(bos_mask, length, total, chunk_size,
+                                                   bool(strict), bool(reset))
+                return Visibility(row_lo=lo, row_hi=hi)
         k_ids = bos_mask.cumsum(dim=1, dtype=torch.int64)
         q_ids = k_ids[:, total - length:]
         sorted_ids = True
@@ -549,7 +568,7 @@ def flash_sca_bwd(y_grad, q, k, v, y, lse, chunk_size, scale, prev_k, prev_v, q_
         raise ValueError("flash_sca_bwd lse must be FP32 [B, Hq, Nq] on Q's device")
     meta = visibility(q, total, chunk_size, q_segment_idx=q_segment_idx,
                       k_segment_idx=k_segment_idx, segment_idx=segment_idx,
-                      bos_mask=bos_mask, reset=reset_chunk_pos_per_seq)
+                      bos_mask=bos_mask, reset=reset_chunk_pos_per_seq, bos_in_call=False)
     return _backward(y_grad, q, k, v, prev_k, prev_v, y, lse, chunk_size, _scale(q, scale), meta,
                      False, deterministic)
 
