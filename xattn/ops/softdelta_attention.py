@@ -37,6 +37,7 @@ not cover every earlier key have no native route there and raise; nothing falls
 back to the PyTorch reference, which runs only when ``backend='torch'`` asks.
 """
 
+import os
 import functools
 from dataclasses import dataclass
 from typing import Optional, Tuple
@@ -276,7 +277,22 @@ def _route(backend: str, q: Tensor, api_name: str = _API) -> str:
         return "sm90"
     if backend == "sm90":
         raise RuntimeError(f"{api_name} requires an SM90 CUDA tensor")
-    return "native" if _native_reads(q) else "torch"
+    if _native_reads(q):
+        return "native"
+    _strict_no_reference(q, api_name, backend)
+    return "torch"
+
+
+def _strict_no_reference(q: Tensor, api_name: str, backend: str) -> None:
+    """Strict mode: on a CUDA device of capability 10.x, a call that did not ask for the PyTorch reference
+    (backend='torch') must not reach it. XLLM_ALLOW_FALLBACK=1 allows it."""
+    if os.environ.get("XLLM_ALLOW_FALLBACK", "") not in ("", "0"):
+        return
+    if q.is_cuda and torch.cuda.get_device_capability(q.device)[0] == 10:
+        raise RuntimeError(
+            f"{api_name} would run the PyTorch reference (_torch_softdelta) on {q.device} (compute capability "
+            f"10.x) with backend={backend!r}: the native route was not selected. q: {tuple(q.shape)} {q.dtype}. "
+            "Strict mode raises instead of running the fallback; set XLLM_ALLOW_FALLBACK=1 to allow it.")
 
 
 def _native_local(q: Tensor, local: Optional[_Local], k_length: int) -> Optional[_Local]:
