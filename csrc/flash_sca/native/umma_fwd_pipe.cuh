@@ -597,6 +597,46 @@ static __device__ unsigned long long g_pipe_rescale_events = 0;
 static __device__ unsigned long long g_pipe_clear_events = 0;
 #endif
 
+// XATTN_FWD_TRACE (a probe define, 0 in every shipped build): per-CTA %globaltimer stamps of the
+// prologue / main loop / epilogue, read back by TryLaunchPipe into $XATTN_FWD_TRACE_OUT.
+#ifndef XATTN_FWD_TRACE
+#define XATTN_FWD_TRACE 0
+#endif
+#if XATTN_FWD_TRACE
+inline constexpr int kTraceSlots = 16;
+inline constexpr int kTraceCtas = 1 << 17;
+static __device__ unsigned long long g_fwd_trace[kTraceCtas * kTraceSlots];
+__device__ __forceinline__ unsigned long long TraceNow() {
+  unsigned long long t;
+  asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t)::"memory");
+  return t;
+}
+__device__ __forceinline__ unsigned TraceSmid() {
+  unsigned s;
+  asm volatile("mov.u32 %0, %%smid;" : "=r"(s));
+  return s;
+}
+#define XFT(slot)                                                                              \
+  do {                                                                                         \
+    const unsigned long long cta_ = (static_cast<unsigned long long>(blockIdx.z) * gridDim.y + \
+                                     blockIdx.y) * gridDim.x + blockIdx.x;                     \
+    if (cta_ < kTraceCtas) g_fwd_trace[cta_ * kTraceSlots + (slot)] = TraceNow();              \
+  } while (0)
+#define XFT_VAL(slot, v)                                                                       \
+  do {                                                                                         \
+    const unsigned long long cta_ = (static_cast<unsigned long long>(blockIdx.z) * gridDim.y + \
+                                     blockIdx.y) * gridDim.x + blockIdx.x;                     \
+    if (cta_ < kTraceCtas) g_fwd_trace[cta_ * kTraceSlots + (slot)] = (v);                     \
+  } while (0)
+#else
+#define XFT(slot) \
+  do {            \
+  } while (0)
+#define XFT_VAL(slot, v) \
+  do {                   \
+  } while (0)
+#endif
+
 // The issuer's S issue distance: S(j + kSAhead) is issued in PV(j)'s iteration. It is the shipped
 // distance, unchanged: two tiles where ONE CTA is resident and O plus three S buffers fit its TMEM
 // (kDv + 3 * kKeys <= kAllocCols), one tile elsewhere (the two-CTA buckets, where the other CTA's
@@ -620,14 +660,18 @@ __global__ void __launch_bounds__(32 * (kSmWarps + 2), Plan<kSmWarps, kKS, kSB, 
   constexpr int kHalves = kSmWarps / 4;
   constexpr int kCols = Pl::kKeys / kHalves;         // S columns per softmax thread
   constexpr int kOCols = Pl::kPipeWidthO / kHalves;  // O columns per softmax thread
-  // Which form the epilogue's O store takes, one rule over the plan's residency and the warp form.
-  // A softmax thread writes kOCols columns of an O row = kOCols * 2 bytes. A one-CTA bucket, or a
-  // thread whose slice is at most one 128 B line, stages O into the dead Q/K/V region and writes it
-  // with one TMA store per 64-column slab. A two-CTA bucket whose thread slice spans two lines keeps
-  // the direct per-row store, which avoids the staged path's serial tail (one named barrier, one
-  // elected issuer, `wait_group.read 0`). The slice follows the warp form, so a bucket whose warp
-  // count changes takes its form from this rule without a separate choice.
+  // Which form the epilogue's O store takes. Every bucket stages O into the dead Q/K/V region and
+  // writes it with one TMA store per 64-column slab (kStageO). The direct per-row store (each
+  // thread writes its row's slice in 16 B pieces, so one warp store instruction touches 32 rows
+  // one y row stride apart) is kept only behind the probe define below.
+  // XATTN_FWD_DIRECT_Y (a probe define, in no build) restores the earlier rule, under which a
+  // two-CTA bucket with 128 O columns per thread ((128,128), (64,128)) kept the direct store; the
+  // per-CTA trace (XATTN_FWD_TRACE) measured that direct epilogue at 2.6-2.8 us per CTA at (128,128).
+#if defined(XATTN_FWD_DIRECT_Y)
   constexpr bool kStageO = Pl::kCtasPerSm == 1 || (kOCols * 2 <= 128);
+#else
+  constexpr bool kStageO = true;
+#endif
   const Params& p = lp.params;
   extern __shared__ __align__(1024) unsigned char smem[];
 
@@ -666,6 +710,7 @@ __global__ void __launch_bounds__(32 * (kSmWarps + 2), Plan<kSmWarps, kKS, kSB, 
   // Set by the producer warp's prologue: the walk's step 0 (the tile above) is already in stage 0
   // of the K and V rings, so the loop starts at step 1. Never true for a CTA with no in-range row.
   bool pre_issued = false;
+  if (tid == 0) XFT(0);
   // Prologue. Q's address needs no row bound (one 128-row slab of one (b, hq)), so the producer
   // initialises Q's barrier itself and issues Q's TMA first, before anything else of the CTA; the
   // MMA warp initialises the other barriers and allocates TMEM; the softmax warps only load the
@@ -773,6 +818,7 @@ __global__ void __launch_bounds__(32 * (kSmWarps + 2), Plan<kSmWarps, kKS, kSB, 
   TmemFenceBeforeSync();
   __syncthreads();
   TmemFenceAfterSync();
+  if (tid == 0) XFT(1);
   int min_lo = red[0], max_hi = red[1], max_lo = red[2], min_hi = red[3];
   for (int w = 1; w < 4; ++w) {
     min_lo = min(min_lo, red[w * 4 + 0]);
@@ -807,6 +853,13 @@ __global__ void __launch_bounds__(32 * (kSmWarps + 2), Plan<kSmWarps, kKS, kSB, 
   if (min_lo > max_hi) {
 // No live row in this CTA: nothing but Q (and the prologue's pre-issued step 0, on the path that
     // pre-issues it) is loaded, and nothing is issued or staged, so this path writes y = 0 itself.
+    if (tid == 0) {
+      unsigned long long info = 0;
+#if XATTN_FWD_TRACE
+      info = static_cast<unsigned long long>(TraceSmid()) << 32;
+#endif
+      XFT_VAL(8, info);
+    }
     if (is_sm) write_dead(h == 0, true);
     if (warp == Pl::kProducerWarp && lane == 0) {
       MbarWait(bar(Pl::kBarQ), 0u);
@@ -823,6 +876,13 @@ __global__ void __launch_bounds__(32 * (kSmWarps + 2), Plan<kSmWarps, kKS, kSB, 
     // route, so the producer's pre-issued stage 0 is exactly step 0 of this walk.
     const int t1 = kTopTile;
     const int n = t1 - t0 + 1;
+    if (tid == 0) {
+      unsigned long long info = 0;
+#if XATTN_FWD_TRACE
+      info = (static_cast<unsigned long long>(TraceSmid()) << 32) | static_cast<unsigned>(n);
+#endif
+      XFT_VAL(8, info);
+    }
 
     // The walk runs DESCENDING: tile index t1 - j at step j, so step 0 is the diagonal tile, the
     // one holding this CTA's own key positions. The mask and the visibility are positional, so
@@ -893,6 +953,7 @@ __global__ void __launch_bounds__(32 * (kSmWarps + 2), Plan<kSmWarps, kKS, kSB, 
       // N = Dv, plus the row-sum column group (L) where Plan::kRowSumMma holds.
       const uint32_t pv_idesc = MakeInstrDesc(fmt, kPipeRows, Pl::kPvN, /*a_major=*/0, /*b_major=*/1);
       MbarWait(bar(Pl::kBarQ), 0u);
+      if (lane == 0) XFT(2);
       // Descriptors built once per CTA. The start-address field is (address >> 4) in 14 bits and
       // every operand address of the CTA's SMEM is below 2^18 B, so adding a 16-byte-unit offset
       // to the 64-bit descriptor equals MakeSmemDesc of the offset address bit for bit; per tile
@@ -1031,10 +1092,12 @@ __global__ void __launch_bounds__(32 * (kSmWarps + 2), Plan<kSmWarps, kKS, kSB, 
       constexpr int kSAhead = SAheadFor<kW, kWv>();
       static_assert(kSAhead >= 1 && kSAhead + 1 <= kSB, "S ring must hold the issue distance");
       for (int p = 0; p < kSAhead && p < n; ++p) issue_s(p);
+      if (lane == 0) XFT(3);
       for (int j = 0; j < n; ++j) {
         if (j + kSAhead < n) issue_s(j + kSAhead);
         issue_pv(j);
       }
+      if (lane == 0) XFT(4);
     } else {
       // ------------------------------------------------------------ softmax warps
       const int col0 = h * kCols;
@@ -1065,6 +1128,7 @@ __global__ void __launch_bounds__(32 * (kSmWarps + 2), Plan<kSmWarps, kKS, kSB, 
         const bool full = !seg && kb >= max_lo && kb + Pl::kKeys - 1 <= min_hi;
         const uint32_t scol = tbase + Pl::kSCol + buf * Pl::kBufCols;
         MbarWait(bar(Pl::kBarS + buf), static_cast<uint32_t>((j / kSB) & 1));
+        if (j == 0 && tid == 0) XFT(5);
         TmemFenceAfterSync();
         float s[kCols];
         if constexpr (kHalves == 1) {
@@ -1299,6 +1363,7 @@ __global__ void __launch_bounds__(32 * (kSmWarps + 2), Plan<kSmWarps, kKS, kSB, 
         MbarWait(bar(Pl::kBarPv + (n - 1) % kSB), static_cast<uint32_t>(((n - 1) / kSB) & 1));
         TmemFenceAfterSync();
       }
+      if (tid == 0) XFT(6);
       // Which form the epilogue uses, by one rule over the plan's residency (kStageO, stated with
       // kOCols above): a CTA with the SM to itself, or a thread whose O slice is at most one line
       // wide, stages O in shared memory and writes it by TMA; every other bucket keeps the direct
@@ -1434,6 +1499,7 @@ __global__ void __launch_bounds__(32 * (kSmWarps + 2), Plan<kSmWarps, kKS, kSB, 
         // store, which does not depend on y: the engine keeps reading while this thread writes lse.
         if (h == 0 && row == 0) TmaStoreWaitRead();
       }
+      if (tid == 0) XFT(7);
     }
   }
 
@@ -1441,6 +1507,7 @@ __global__ void __launch_bounds__(32 * (kSmWarps + 2), Plan<kSmWarps, kKS, kSB, 
   TmemFenceBeforeSync();
   __syncthreads();
   TmemFenceAfterSync();
+  if (tid == 0) XFT(9);
   if (warp == Pl::kMmaWarp) TmemDealloc(tbase, Pl::kAllocCols);  // the allocating warp
 }
 
@@ -1630,6 +1697,14 @@ int TryLaunchPipe(const UmmaLaunchParams& lp, cudaStream_t stream) {
   // Drop any error latched before this point, so the status read after the launch call is that
   // launch's own (LaunchUmmaForward drains at its entry too; the attribute calls consume theirs).
   (void)cudaGetLastError();
+#if XATTN_FWD_TRACE
+  if (std::getenv("XATTN_FWD_TRACE_OUT") != nullptr) {
+    void* tp = nullptr;
+    if (cudaGetSymbolAddress(&tp, g_fwd_trace) == cudaSuccess)
+      (void)cudaMemsetAsync(tp, 0, sizeof(unsigned long long) * kTraceCtas * kTraceSlots, stream);
+    (void)cudaGetLastError();
+  }
+#endif
   kernel<<<grid, threads, smem_bytes, stream>>>(lp, kRescaleThreshold);
   const cudaError_t launch_err = cudaGetLastError();
   if (launch_err != cudaSuccess) {
@@ -1640,6 +1715,28 @@ int TryLaunchPipe(const UmmaLaunchParams& lp, cudaStream_t stream) {
     ThrowPostAttemptError(body);
   }
   PipeLaunchCount().fetch_add(1, std::memory_order_relaxed);
+#if XATTN_FWD_TRACE
+  {
+    // Probe builds only: append this launch's per-CTA stamps to $XATTN_FWD_TRACE_OUT.
+    const char* out = std::getenv("XATTN_FWD_TRACE_OUT");
+    if (out != nullptr) {
+      const size_t ctas = std::min<size_t>(static_cast<size_t>(grid.x) * grid.y * grid.z, kTraceCtas);
+      unsigned long long* hbuf = new unsigned long long[ctas * kTraceSlots];
+      if (cudaStreamSynchronize(stream) == cudaSuccess &&
+          cudaMemcpyFromSymbol(hbuf, g_fwd_trace, ctas * kTraceSlots * 8) == cudaSuccess) {
+        if (FILE* f = std::fopen(out, "ab")) {
+          const unsigned long long hdr[4] = {0x5452414345ull, grid.x, grid.y, grid.z};
+          std::fwrite(hdr, 8, 4, f);
+          std::fwrite(hbuf, 8, ctas * kTraceSlots, f);
+          std::fclose(f);
+        }
+      } else {
+        (void)cudaGetLastError();
+      }
+      delete[] hbuf;
+    }
+  }
+#endif
 #if defined(XATTN_FWD_PROBE_HOOKS) && XATTN_FWD_PROBE_HOOKS
   {
     // Probe builds only: the cumulative lazy-rescale and clear counts of this element type after
