@@ -1005,12 +1005,23 @@ bool CanLaunchUmmaBackwardKvPipe(const UmmaLaunchParams& lp) {
 
 // The launch (declared in umma_bwd_dkdv.cuh): the preflight again, then the committed launch.
 // `false` means refused and nothing was written; after the preflight every driver error raises.
+// The plain key launch in 128-query rounds (umma_bwd_kv_r128.cuh): defined there, after this
+// header. False when the device's opt-in SMEM cannot hold its plan (the caller then runs KvPipe).
+template <typename E>
+bool LaunchUmmaBackwardKvR128PlainT(const UmmaLaunchParams& lp, cudaStream_t stream);
+
 // Each enqueued launch adds one to kvpipe::KvPipeLaunchCount() (bwd_pipe_host.h).
+// H2 r1: every call this preflight accepts with 16-bit key gradients runs the (128,128) key leaf
+// in 128-query rounds (BackwardKvR128Kernel: N = 128 score MMAs, which run at the full UMMA rate
+// where KvPipe's N = 64 ones run at ~72%). Its dK / dV are KvPipe's bits (same K = 16 query
+// steps, same order, same operands; umma_bwd_kv_r128.cuh). FP32 key gradients (SoftDelta's
+// fp32_kv_grads reads) keep KvPipe below.
 template <typename E>
 bool LaunchUmmaBackwardKvPipe(const UmmaLaunchParams& lp, cudaStream_t stream) {
   using Pl = kvpipe::Plan<kvpipe::kRingStages>;
   const Params& p = lp.params;
   if (!CanLaunchUmmaBackwardKvPipe<E>(lp)) return false;
+  if (!p.key_grads_fp32 && LaunchUmmaBackwardKvR128PlainT<E>(lp, stream)) return true;
   const auto kernel = p.key_grads_fp32 ? kvpipe::BackwardKvPipeKernel<E, kvpipe::kRingStages, true>
                                        : kvpipe::BackwardKvPipeKernel<E, kvpipe::kRingStages, false>;
   const cudaError_t attr =

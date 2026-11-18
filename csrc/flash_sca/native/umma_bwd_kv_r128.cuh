@@ -536,5 +536,40 @@ bool LaunchUmmaBackwardKvR128CompanionT(const UmmaLaunchParams& lp, const KvComp
   return true;
 }
 
+// H2 r1: the plain call (no companion read) in 128-query rounds, the default of
+// LaunchUmmaBackwardKvPipe for 16-bit key gradients. The caller has run KvPipe's preflight.
+// Returns false, enqueuing nothing, when the device's opt-in SMEM cannot hold this plan.
+template <typename E>
+bool LaunchUmmaBackwardKvR128PlainT(const UmmaLaunchParams& lp, cudaStream_t stream) {
+  using Pl = kvr128::Plan;
+  const Params& p = lp.params;
+  int device = 0;
+  cudaError_t q = cudaGetDevice(&device);
+  if (q != cudaSuccess) dkdv_detail::RaiseCuda("flash_sca native bwd kv r128: cudaGetDevice", q);
+  int smem_cap = 0;
+  q = cudaDeviceGetAttribute(&smem_cap, cudaDevAttrMaxSharedMemoryPerBlockOptin, device);
+  if (q != cudaSuccess) dkdv_detail::RaiseCuda("flash_sca native bwd kv r128: shared memory", q);
+  if (static_cast<int>(Pl::kSmemBytes) > smem_cap) return false;
+  const auto kernel = kvr128::BackwardKvR128Kernel<E, false>;
+  const cudaError_t attr =
+      cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, Pl::kSmemBytes);
+  if (attr != cudaSuccess) {
+    dkdv_detail::RaiseCuda("flash_sca native bwd kv r128: cudaFuncSetAttribute", attr);
+  }
+  const unsigned gx =
+      static_cast<unsigned>((p.total_length + kvpipe::kKeyRows - 1) / kvpipe::kKeyRows);
+  if (gx == 0) return true;  // no work (see LaunchUmmaBackwardDkdv)
+  const dim3 grid(gx, static_cast<unsigned>(p.kv_heads), static_cast<unsigned>(p.batch));
+  KvPipeLaunch launch{};
+  launch.lp = lp;
+  kernel<<<grid, kvr128::kThreads, Pl::kSmemBytes, stream>>>(launch);
+  const cudaError_t launched = cudaGetLastError();
+  if (launched != cudaSuccess) {
+    dkdv_detail::RaiseCuda("flash_sca native bwd kv r128: kernel launch", launched);
+  }
+  kvpipe::KvPipeLaunchCount().fetch_add(1, std::memory_order_relaxed);
+  return true;
+}
+
 }  // namespace umma
 }  // namespace xattn::ops::flash_sca_native

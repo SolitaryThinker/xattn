@@ -24,6 +24,11 @@ template bool xattn::ops::flash_sca_native::umma::CanLaunchUmmaBackwardKvPipe<__
     const xattn::ops::flash_sca_native::umma::UmmaLaunchParams&);
 template bool xattn::ops::flash_sca_native::umma::LaunchUmmaBackwardKvPipe<__nv_bfloat16>(
     const xattn::ops::flash_sca_native::umma::UmmaLaunchParams&, cudaStream_t);
+// H2 r1: the plain 128-query-round launch LaunchUmmaBackwardKvPipe defaults to (16-bit key grads).
+template bool xattn::ops::flash_sca_native::umma::LaunchUmmaBackwardKvR128PlainT<__nv_bfloat16>(
+    const xattn::ops::flash_sca_native::umma::UmmaLaunchParams&, cudaStream_t);
+template bool xattn::ops::flash_sca_native::umma::LaunchUmmaBackwardKvR128PlainT<__half>(
+    const xattn::ops::flash_sca_native::umma::UmmaLaunchParams&, cudaStream_t);
 template bool xattn::ops::flash_sca_native::umma::CanLaunchUmmaBackwardKvPipe<__half>(
     const xattn::ops::flash_sca_native::umma::UmmaLaunchParams&);
 template bool xattn::ops::flash_sca_native::umma::LaunchUmmaBackwardKvPipe<__half>(
