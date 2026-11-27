@@ -31,9 +31,9 @@
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/util/Exception.h>
 
+#include <array>
 #include <cstdint>
 #include <optional>
-#include <vector>
 
 #include "flash_sca/native/params.h"
 #include "flash_sca/native/umma_host.h"
@@ -195,22 +195,22 @@ inline BackwardUmma PrepareBackwardUmma(const at::Tensor& q, const at::Tensor& k
   // only happens to have the right numel is a wrong answer, not a slow one:
   // sizes and dtype are exact, contiguity is required, and the saved pointer
   // must carry the 16-byte alignment its vector loads assume.
-  const std::vector<int64_t> stat_shape{p.batch, p.query_heads, p.q_length};
-  const std::vector<int64_t> saved_shape{p.batch, p.q_length, p.query_heads, p.value_dim};
+  const std::array<int64_t, 3> stat_shape{p.batch, p.query_heads, p.q_length};
+  const std::array<int64_t, 4> saved_shape{p.batch, p.q_length, p.query_heads, p.value_dim};
   if (lse_c.scalar_type() != at::kFloat || lse_c.numel() == 0 || !lse_c.is_contiguous() ||
-      lse_c.sizes() != stat_shape ||
+      lse_c.sizes() != at::IntArrayRef(stat_shape) ||
       reinterpret_cast<uintptr_t>(lse_c.data_ptr()) % 16 != 0) {
     out.refusal = Refusal::kState;
     return out;
   }
   if (delta.scalar_type() != at::kFloat || !delta.is_contiguous() ||
-      delta.sizes() != stat_shape ||
+      delta.sizes() != at::IntArrayRef(stat_shape) ||
       reinterpret_cast<uintptr_t>(delta.data_ptr()) % 16 != 0) {
     out.refusal = Refusal::kState;
     return out;
   }
   if ((saved_c.scalar_type() != q.scalar_type() && saved_c.scalar_type() != at::kFloat) ||
-      !saved_c.is_contiguous() || saved_c.sizes() != saved_shape ||
+      !saved_c.is_contiguous() || saved_c.sizes() != at::IntArrayRef(saved_shape) ||
       reinterpret_cast<uintptr_t>(saved_c.data_ptr()) % 16 != 0) {
     out.refusal = Refusal::kState;
     return out;
@@ -226,7 +226,7 @@ inline BackwardUmma PrepareBackwardUmma(const at::Tensor& q, const at::Tensor& k
   // raw row-major `const void*` beside the map: a strided-but-describable dy
   // (a head-sliced view) encodes a lawful map and then reads as dense rows, i.e.
   // a silently wrong gradient in any leaf that uses the raw pointer.
-  if (dy_c.scalar_type() != q.scalar_type() || dy_c.sizes() != saved_shape ||
+  if (dy_c.scalar_type() != q.scalar_type() || dy_c.sizes() != at::IntArrayRef(saved_shape) ||
       !dy_c.is_contiguous()) {
     out.refusal = Refusal::kState;
     return out;
@@ -280,24 +280,28 @@ inline BackwardUmma PrepareBackwardUmma(const at::Tensor& q, const at::Tensor& k
   // today, and a refusal here would duplicate one rule across two layers and
   // fail-closed on a call that works. What is checked here is the layout of
   // each gradient that *is* present.
-  const std::vector<int64_t> dq_shape{p.batch, p.q_length, p.query_heads, p.qk_dim};
-  const std::vector<int64_t> dk_shape{p.batch, p.k_length, p.kv_heads, p.qk_dim};
-  const std::vector<int64_t> dv_shape{p.batch, p.k_length, p.kv_heads, p.value_dim};
+  const std::array<int64_t, 4> dq_shape{p.batch, p.q_length, p.query_heads, p.qk_dim};
+  const std::array<int64_t, 4> dk_shape{p.batch, p.k_length, p.kv_heads, p.qk_dim};
+  const std::array<int64_t, 4> dv_shape{p.batch, p.k_length, p.kv_heads, p.value_dim};
   // The key gradients are FP32 when the call asked for them (Params::key_grads_fp32).
   const at::ScalarType key_type = p.key_grads_fp32 ? at::kFloat : q.scalar_type();
-  if (!dq.is_contiguous() || dq.scalar_type() != q.scalar_type() || dq.sizes() != dq_shape ||
-      !dk.is_contiguous() || dk.scalar_type() != key_type || dk.sizes() != dk_shape ||
-      !dv.is_contiguous() || dv.scalar_type() != key_type || dv.sizes() != dv_shape) {
+  if (!dq.is_contiguous() || dq.scalar_type() != q.scalar_type() ||
+      dq.sizes() != at::IntArrayRef(dq_shape) ||
+      !dk.is_contiguous() || dk.scalar_type() != key_type ||
+      dk.sizes() != at::IntArrayRef(dk_shape) ||
+      !dv.is_contiguous() || dv.scalar_type() != key_type ||
+      dv.sizes() != at::IntArrayRef(dv_shape)) {
     out.refusal = Refusal::kLayout;
     return out;
   }
   if (dprev_k != nullptr || dprev_v != nullptr) {
-    const std::vector<int64_t> dprev_k_shape{p.batch, p.prev_length, p.kv_heads, p.qk_dim};
-    const std::vector<int64_t> dprev_v_shape{p.batch, p.prev_length, p.kv_heads, p.value_dim};
+    const std::array<int64_t, 4> dprev_k_shape{p.batch, p.prev_length, p.kv_heads, p.qk_dim};
+    const std::array<int64_t, 4> dprev_v_shape{p.batch, p.prev_length, p.kv_heads, p.value_dim};
     if (dprev_k == nullptr || dprev_v == nullptr ||
         !dprev_k->is_contiguous() || dprev_k->scalar_type() != key_type ||
-        dprev_k->sizes() != dprev_k_shape || !dprev_v->is_contiguous() ||
-        dprev_v->scalar_type() != key_type || dprev_v->sizes() != dprev_v_shape) {
+        dprev_k->sizes() != at::IntArrayRef(dprev_k_shape) || !dprev_v->is_contiguous() ||
+        dprev_v->scalar_type() != key_type ||
+        dprev_v->sizes() != at::IntArrayRef(dprev_v_shape)) {
       out.refusal = Refusal::kLayout;
       return out;
     }
@@ -390,10 +394,12 @@ inline BackwardUmma PrepareBackwardUmma(const at::Tensor& q, const at::Tensor& k
     // non-packed path and a TORCH_CHECK out of `at::cat`, not a refusal, on the
     // packed one. `kLayout`, because an extent is a layout fact and
     // describability is `kMapSource`.
-    const std::vector<int64_t> prev_k_shape{p.batch, p.prev_length, p.kv_heads, p.qk_dim};
-    const std::vector<int64_t> prev_v_shape{p.batch, p.prev_length, p.kv_heads, p.value_dim};
-    if (prev_k->scalar_type() != q.scalar_type() || prev_k->sizes() != prev_k_shape ||
-        prev_v->scalar_type() != q.scalar_type() || prev_v->sizes() != prev_v_shape) {
+    const std::array<int64_t, 4> prev_k_shape{p.batch, p.prev_length, p.kv_heads, p.qk_dim};
+    const std::array<int64_t, 4> prev_v_shape{p.batch, p.prev_length, p.kv_heads, p.value_dim};
+    if (prev_k->scalar_type() != q.scalar_type() ||
+        prev_k->sizes() != at::IntArrayRef(prev_k_shape) ||
+        prev_v->scalar_type() != q.scalar_type() ||
+        prev_v->sizes() != at::IntArrayRef(prev_v_shape)) {
       out.refusal = Refusal::kLayout;
       return out;
     }
@@ -431,14 +437,43 @@ inline BackwardUmma PrepareBackwardUmma(const at::Tensor& q, const at::Tensor& k
   }
 
   // 11. Maps. Axes are [column, head, row, batch]; a tile starts at [d,h,r,b].
+  const int dev = static_cast<int>(q.get_device());
   UmmaInputMaps& m = out.launch.maps;
-  m.q = EncodeInputMap(p.q, p.element, B, Nq, Hq, D);
-  m.dy = EncodeInputMap(dy_op, p.element, B, Nq, Hq, Dv);
-  m.k = EncodeInputMap(src_k, p.element, B, pack ? Nt : Nk, Hkv, D);
-  m.v = EncodeInputMap(src_v, p.element, B, pack ? Nt : Nk, Hkv, Dv);
+  m.q = CachedInputMap(p.q, p.element, B, Nq, Hq, D, dev);
+  m.dy = CachedInputMap(dy_op, p.element, B, Nq, Hq, Dv, dev);
+  m.k = CachedInputMap(src_k, p.element, B, pack ? Nt : Nk, Hkv, D, dev);
+  m.v = CachedInputMap(src_v, p.element, B, pack ? Nt : Nk, Hkv, Dv, dev);
   if (has_prev && !pack) {
-    m.prev_k = EncodeInputMap(p.prev_k, p.element, B, p.prev_length, Hkv, D);
-    m.prev_v = EncodeInputMap(p.prev_v, p.element, B, p.prev_length, Hkv, Dv);
+    m.prev_k = CachedInputMap(p.prev_k, p.element, B, p.prev_length, Hkv, D, dev);
+    m.prev_v = CachedInputMap(p.prev_v, p.element, B, p.prev_length, Hkv, Dv, dev);
+  }
+  // Backward output TMA store maps (same 64x64 SWIZZLE_128B layout as inputs; TMA clips OOB).
+  if (B > 0 && Nq > 0) {
+    const Operand dq_op = MakeOperand(dq);
+    if (MirrorEncodeChecks(dq_op, B, Nq, Hq, D)) {
+      m.dq = CachedInputMap(dq_op, p.element, B, Nq, Hq, D, dev);
+      m.has_dq_map = true;
+    }
+  }
+  if (!p.key_grads_fp32 && B > 0 && Nk > 0) {
+    const Operand dk_op = MakeOperand(dk);
+    const Operand dv_op = MakeOperand(dv);
+    if (MirrorEncodeChecks(dk_op, B, Nk, Hkv, D) && MirrorEncodeChecks(dv_op, B, Nk, Hkv, Dv)) {
+      m.dk = CachedInputMap(dk_op, p.element, B, Nk, Hkv, D, dev);
+      m.dv = CachedInputMap(dv_op, p.element, B, Nk, Hkv, Dv, dev);
+      m.has_dkv_map = true;
+    }
+  }
+  if (!p.key_grads_fp32 && has_prev && B > 0 && p.prev_length > 0 &&
+      dprev_k != nullptr && dprev_v != nullptr) {
+    const Operand dpk_op = MakeOperand(*dprev_k);
+    const Operand dpv_op = MakeOperand(*dprev_v);
+    if (MirrorEncodeChecks(dpk_op, B, p.prev_length, Hkv, D) &&
+        MirrorEncodeChecks(dpv_op, B, p.prev_length, Hkv, Dv)) {
+      m.dprev_k = CachedInputMap(dpk_op, p.element, B, p.prev_length, Hkv, D, dev);
+      m.dprev_v = CachedInputMap(dpv_op, p.element, B, p.prev_length, Hkv, Dv, dev);
+      m.has_dprev_kv_map = true;
+    }
   }
   // Invariant, normative: with packed_kv set, key/value are consumed through
   // the maps only; Params::prev_k / Params::prev_v describe the call's logical
@@ -520,62 +555,6 @@ inline at::Tensor CanonicalizeTmaInput(const at::Tensor& tensor) {
   return result;
 }
 
-// A repeat call's maps. A tensor map is a pure function of what EncodeInputMap reads - the
-// device it is encoded on, the source's base address and three strides, the element type and
-// the four extents (umma_host.h) - so a map encoded once for that complete key is the map a
-// fresh encode would produce, byte for byte. This per-thread cache of the last few keys lets a
-// call whose operands sit where the previous call's did skip the encode (and its cudaSetDevice):
-// a changed pointer, stride, dtype, extent or device is a different key and is encoded afresh.
-// The cache holds descriptors only (128-byte values), never a tensor or a device buffer.
-struct InputMapKey {
-  int device = -1;
-  const void* ptr = nullptr;
-  int64_t batch_stride = 0, row_stride = 0, head_stride = 0;
-  int element = 0;
-  int64_t batch = 0, rows = 0, heads = 0, columns = 0;
-  bool operator==(const InputMapKey& o) const {
-    return device == o.device && ptr == o.ptr && batch_stride == o.batch_stride &&
-           row_stride == o.row_stride && head_stride == o.head_stride && element == o.element &&
-           batch == o.batch && rows == o.rows && heads == o.heads && columns == o.columns;
-  }
-};
-
-inline CUtensorMap CachedInputMap(const Operand& source, Element element, int64_t batch,
-                                  int64_t rows, int64_t heads, int64_t columns) {
-  constexpr int kEntries = 8;
-  struct Entry {
-    InputMapKey key;
-    CUtensorMap map;
-    bool valid = false;
-  };
-  thread_local Entry entries[kEntries];
-  thread_local int next = 0;
-  int device = 0;
-  C10_CUDA_CHECK(cudaGetDevice(&device));
-  InputMapKey key;
-  key.device = device;
-  key.ptr = source.ptr;
-  key.batch_stride = source.batch_stride;
-  key.row_stride = source.row_stride;
-  key.head_stride = source.head_stride;
-  key.element = static_cast<int>(element);
-  key.batch = batch;
-  key.rows = rows;
-  key.heads = heads;
-  key.columns = columns;
-  for (const Entry& e : entries) {
-    if (e.valid && e.key == key) return e.map;
-  }
-  // A miss encodes exactly as before (and raises exactly as before on an invalid source).
-  const CUtensorMap map = EncodeInputMap(source, element, batch, rows, heads, columns);
-  Entry& slot = entries[next];
-  next = (next + 1) % kEntries;
-  slot.key = key;
-  slot.map = map;
-  slot.valid = true;
-  return map;
-}
-
 // Strong references remain live through launch submission on the caller's
 // current stream. Tensor maps contain addresses, not ownership of storage.
 struct PreparedUmmaCall {
@@ -623,28 +602,29 @@ inline PreparedUmmaCall PrepareUmmaCall(
   }
   if (p.batch == 0) return result;
 
-  maps.q = CachedInputMap(p.q, p.element, p.batch, p.q_length, p.query_heads, p.qk_dim);
+  const int dev = static_cast<int>(q.get_device());
+  maps.q = CachedInputMap(p.q, p.element, p.batch, p.q_length, p.query_heads, p.qk_dim, dev);
   maps.packed_kv = p.prev_length != 0 && p.prev_length % kKeyMapAlignment != 0;
   if (maps.packed_kv) {
     result.packed_k = at::cat({result.prev_k, result.k}, 1);
     result.packed_v = at::cat({result.prev_v, result.v}, 1);
     maps.k = CachedInputMap(bwd_host::MakeOperand(result.packed_k), p.element, p.batch,
-                            p.total_length, p.kv_heads, p.qk_dim);
+                            p.total_length, p.kv_heads, p.qk_dim, dev);
     maps.v = CachedInputMap(bwd_host::MakeOperand(result.packed_v), p.element, p.batch,
-                            p.total_length, p.kv_heads, p.value_dim);
+                            p.total_length, p.kv_heads, p.value_dim, dev);
   } else {
-    maps.k = CachedInputMap(p.k, p.element, p.batch, p.k_length, p.kv_heads, p.qk_dim);
-    maps.v = CachedInputMap(p.v, p.element, p.batch, p.k_length, p.kv_heads, p.value_dim);
+    maps.k = CachedInputMap(p.k, p.element, p.batch, p.k_length, p.kv_heads, p.qk_dim, dev);
+    maps.v = CachedInputMap(p.v, p.element, p.batch, p.k_length, p.kv_heads, p.value_dim, dev);
     if (p.prev_length != 0) {
       maps.prev_k =
-          CachedInputMap(p.prev_k, p.element, p.batch, p.prev_length, p.kv_heads, p.qk_dim);
+          CachedInputMap(p.prev_k, p.element, p.batch, p.prev_length, p.kv_heads, p.qk_dim, dev);
       maps.prev_v =
-          CachedInputMap(p.prev_v, p.element, p.batch, p.prev_length, p.kv_heads, p.value_dim);
+          CachedInputMap(p.prev_v, p.element, p.batch, p.prev_length, p.kv_heads, p.value_dim, dev);
     }
   }
   if (dy) {
-    maps.dy = EncodeInputMap(bwd_host::MakeOperand(result.dy), p.element, p.batch, p.q_length,
-                             p.query_heads, p.value_dim);
+    maps.dy = CachedInputMap(bwd_host::MakeOperand(result.dy), p.element, p.batch, p.q_length,
+                             p.query_heads, p.value_dim, dev);
   }
   return result;
 }

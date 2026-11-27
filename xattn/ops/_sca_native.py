@@ -579,7 +579,8 @@ def flash_sca_bwd(y_grad, q, k, v, y, lse, chunk_size, scale, prev_k, prev_v, q_
         raise ValueError("flash_sca_bwd lse must be FP32 [B, Hq, Nq] on Q's device")
     meta = visibility(q, total, chunk_size, q_segment_idx=q_segment_idx,
                       k_segment_idx=k_segment_idx, segment_idx=segment_idx,
-                      bos_mask=bos_mask, reset=reset_chunk_pos_per_seq, bos_in_call=False)
+                      bos_mask=bos_mask, reset=reset_chunk_pos_per_seq,
+                      bos_in_call=(not reset_chunk_pos_per_seq and total <= _MASK_MAX_KEYS))
     return _backward(y_grad, q, k, v, prev_k, prev_v, y, lse, chunk_size, _scale(q, scale), meta,
                      False, deterministic)
 

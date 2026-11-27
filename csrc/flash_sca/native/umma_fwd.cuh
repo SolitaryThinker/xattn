@@ -688,17 +688,25 @@ bool LaunchUmmaForward(const UmmaLaunchParams& params, cudaStream_t stream) {
   // only gencode this package emits for the leaf, sm_103a; a wider gencode widens this
   // line. A future dispatcher should do this once per device, not once per call.
   int cc_device = 0;
-  int cc_major = 0;
-  int cc_minor = 0;
-  const bool cc_known =
-      cudaGetDevice(&cc_device) == cudaSuccess &&
-      cudaDeviceGetAttribute(&cc_major, cudaDevAttrComputeCapabilityMajor, cc_device) ==
-          cudaSuccess &&
-      cudaDeviceGetAttribute(&cc_minor, cudaDevAttrComputeCapabilityMinor, cc_device) ==
-          cudaSuccess;
-  if (!cc_known || cc_major != 10 || cc_minor < 3) {
+  if (cudaGetDevice(&cc_device) != cudaSuccess) {
     (void)cudaGetLastError();
     return false;
+  }
+  static std::atomic<uint64_t> cc_ok_mask{0};
+  const uint64_t cc_bit = (cc_device >= 0 && cc_device < 64) ? (uint64_t(1) << cc_device) : 0;
+  if (cc_bit == 0 || (cc_ok_mask.load(std::memory_order_acquire) & cc_bit) == 0) {
+    int cc_major = 0;
+    int cc_minor = 0;
+    const bool cc_known =
+        cudaDeviceGetAttribute(&cc_major, cudaDevAttrComputeCapabilityMajor, cc_device) ==
+            cudaSuccess &&
+        cudaDeviceGetAttribute(&cc_minor, cudaDevAttrComputeCapabilityMinor, cc_device) ==
+            cudaSuccess;
+    if (!cc_known || cc_major != 10 || cc_minor < 3) {
+      (void)cudaGetLastError();
+      return false;
+    }
+    if (cc_bit != 0) cc_ok_mask.fetch_or(cc_bit, std::memory_order_release);
   }
   // Every (D, Dv) bucket pair has an instantiation of the pipelined body (umma_fwd_pipe.cuh). It
   // takes every call host.cc resolved to it (fwdpipe::ForwardBody::kPipe), and its launch or its

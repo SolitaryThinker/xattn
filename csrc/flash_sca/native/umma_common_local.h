@@ -130,21 +130,23 @@ __device__ __forceinline__ bool MbarTryWait(uint32_t mbar, uint32_t phase) {
 #endif
 }
 
-// Bounded. A wait that never completes means a wrong phase, a missing arrival, or
-// an expect_tx that was never posted - a kernel bug. Spinning forever on it turns
-// that bug into a hang that holds the GPU until someone kills the allocation, so
-// the wait gives up and traps: one thread, one report, no silent stall. The bound
-// is ~4.2M backoff rounds; at the 20 ns granularity below that is far longer than
-// any legitimate wait at these tile sizes (a whole 128x64x256 bf16 MMA stage is
-// microseconds), so a live pipeline never reaches it.
+// Hardware-suspended parity wait: mbarrier.try_wait.parity suspends the warp in hardware and wakes
+// immediately on the exact cycle the mbarrier phase flips, avoiding nanosleep overshoot and spin
+// counter registers on hot warp-specialized UMMA loops.
 __device__ __forceinline__ void MbarWait(uint32_t mbar, uint32_t phase) {
 #if XATTN_UMMA_DEVICE_ASM
-  constexpr uint32_t kSpinBound = 1u << 22;
-  uint32_t spins = 0;
-  while (!MbarTryWait(mbar, phase)) {
-    if (++spins > kSpinBound) __trap();
-    __nanosleep(20);
-  }
+  asm volatile(
+      "{\n\t"
+      ".reg .pred P;\n\t"
+      "LAB_MBAR_WAIT_%=:\n\t"
+      "mbarrier.try_wait.parity.shared::cta.b64 P, [%0], %1;\n\t"
+      "@!P bra.uni LAB_MBAR_WAIT_%=;\n\t"
+      "}\n"
+      :: "r"(mbar), "r"(phase)
+      : "memory");
+#else
+  (void)mbar;
+  (void)phase;
 #endif
 }
 
@@ -200,6 +202,61 @@ __device__ __forceinline__ void MmaCommit(uint32_t mbar) {
         "tcgen05.commit.cta_group::1.mbarrier::arrive::one.shared::cluster.b64 [%0];" ::"r"(mbar)
         : "memory");
   }
+#endif
+}
+
+// Raw single-thread UMMA / TMEM copy / commit helpers (caller already elected one lane;
+// omits the optional all-zero disable-output-lane vector and takes precomputed 64-bit SMEM
+// descriptors directly).
+__device__ __forceinline__ void MmaSsRaw(uint32_t dtmem, uint64_t a, uint64_t b, uint32_t idesc,
+                                         uint32_t accumulate) {
+#if XATTN_UMMA_DEVICE_ASM
+  asm volatile(
+      "{\n\t.reg .pred p;\n\tsetp.ne.b32 p, %4, 0;\n\t"
+      "tcgen05.mma.cta_group::1.kind::f16 [%0], %1, %2, %3, p;\n\t}\n" ::"r"(dtmem),
+      "l"(a), "l"(b), "r"(idesc), "r"(accumulate));
+#else
+  (void)dtmem;
+  (void)a;
+  (void)b;
+  (void)idesc;
+  (void)accumulate;
+#endif
+}
+
+__device__ __forceinline__ void MmaTsRaw(uint32_t dtmem, uint32_t atmem, uint64_t b,
+                                         uint32_t idesc, uint32_t accumulate) {
+#if XATTN_UMMA_DEVICE_ASM
+  asm volatile(
+      "{\n\t.reg .pred p;\n\tsetp.ne.b32 p, %4, 0;\n\t"
+      "tcgen05.mma.cta_group::1.kind::f16 [%0], [%1], %2, %3, p;\n\t}\n" ::"r"(dtmem),
+      "r"(atmem), "l"(b), "r"(idesc), "r"(accumulate));
+#else
+  (void)dtmem;
+  (void)atmem;
+  (void)b;
+  (void)idesc;
+  (void)accumulate;
+#endif
+}
+
+__device__ __forceinline__ void MmaCommitRaw(uint32_t mbar) {
+#if XATTN_UMMA_DEVICE_ASM
+  asm volatile(
+      "tcgen05.commit.cta_group::1.mbarrier::arrive::one.shared::cluster.b64 [%0];" ::"r"(mbar)
+      : "memory");
+#else
+  (void)mbar;
+#endif
+}
+
+__device__ __forceinline__ void TmemCopy128x256bRaw(uint32_t taddr, uint64_t src_desc) {
+#if XATTN_UMMA_DEVICE_ASM
+  asm volatile("tcgen05.cp.cta_group::1.128x256b [%0], %1;" ::"r"(taddr), "l"(src_desc)
+               : "memory");
+#else
+  (void)taddr;
+  (void)src_desc;
 #endif
 }
 

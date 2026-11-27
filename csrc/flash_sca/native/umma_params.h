@@ -28,17 +28,38 @@ struct UmmaInputMaps {
   // slab and 64 rows). Encoded only for a forward call whose body is the pipelined one; the
   // backward leaves it zero.
   CUtensorMap y{};
+  // Backward output TMA store maps (128B swizzle, 64x64 boxes), encoded in PrepareBackwardUmma
+  // when the corresponding output tensor passes TMA alignment/stride checks.
+  CUtensorMap dq{};
+  CUtensorMap dk{};
+  CUtensorMap dv{};
+  CUtensorMap dprev_k{};
+  CUtensorMap dprev_v{};
+  bool has_dq_map = false;
+  bool has_dkv_map = false;
+  bool has_dprev_kv_map = false;
 
   // False: k/v describe current K/V and prev_k/prev_v describe the previous
   // chunk when present. True: k/v describe the packed total [previous;current]
   // key axis and prev_k/prev_v must not be read. Params::prev_length always
   // retains its logical value for masks and the gradient output split.
   bool packed_kv = false;
+
+  // Optional forward persistent-LJF scheduling metadata (populated on forward kPipe calls).
+  const int32_t* fwd_ljf_order = nullptr;
+  unsigned int* fwd_counter = nullptr;
+  bool tile128_bounds_ready = false;
 };
 
 struct UmmaLaunchParams {
   Params params;
   UmmaInputMaps maps;
+  // Optional precomputed deterministic longest-job-first (LJF) worklists and pre-zeroed counters.
+  // Built concurrently on the metadata stream; nullptr falls back to identity order / local counter.
+  const int32_t* kv_ljf_order = nullptr;
+  const int32_t* q_ljf_order = nullptr;
+  unsigned int* kv_counter = nullptr;
+  unsigned int* dq_counter = nullptr;
 };
 
 // Host launch wrappers accept a reference; the CUDA kernels take a const

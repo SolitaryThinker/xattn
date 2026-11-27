@@ -220,13 +220,17 @@ __device__ __forceinline__ void StoreKeyGrad32(void* row, int64_t c, int64_t wid
   } else {
     E* out = static_cast<E*>(row) + c;
     if (c + 32 <= width) {
-      // 32 contiguous elements = 64 bytes, stored as four 16-byte stores.
+      // 32 contiguous elements = 64 bytes, stored as four 16-byte stores (vectorized f32x2 + Pack2Fast).
       union {
         uint4 u4[4];
-        E e[32];
+        uint32_t w[16];
       } pk;
+      const float2 mul2 = make_float2(mul, mul);
 #pragma unroll
-      for (int x = 0; x < 32; ++x) pk.e[x] = BwdTok<E>::To(v[x] * mul);
+      for (int x = 0; x < 16; ++x) {
+        const float2 m = pt::MulX2(make_float2(v[2 * x], v[2 * x + 1]), mul2);
+        pk.w[x] = pt::Pack2Fast<E>::Of(m.x, m.y);
+      }
       reinterpret_cast<uint4*>(out)[0] = pk.u4[0];
       reinterpret_cast<uint4*>(out)[1] = pk.u4[1];
       reinterpret_cast<uint4*>(out)[2] = pk.u4[2];

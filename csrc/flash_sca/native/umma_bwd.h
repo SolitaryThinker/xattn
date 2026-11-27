@@ -89,7 +89,9 @@ int BwdLegTimerDropped();                        // slots lost: device had not c
 // refusal/error after commitment raises; it never replays another producer.
 // The host folds scratch exactly once iff needs_dq_accumulator() is true.
 void LaunchBackwardPhases(const Params& params, const umma::UmmaLaunchParams& native,
-                          const BackwardPhases& phases, cudaStream_t stream);
+                          const BackwardPhases& phases, cudaStream_t stream,
+                          bool tables_ready_on_fork = false, cudaStream_t fork_stream = nullptr,
+                          cudaEvent_t meta_done_event = nullptr, bool skip_recheck = false);
 
 // The native SoftDelta pair backward (kv_companion.h): the grouped read `g*` and the strict read
 // `s*` over the same K/V. Eligible when both dQ leaves and the grouped key leaf are native, no

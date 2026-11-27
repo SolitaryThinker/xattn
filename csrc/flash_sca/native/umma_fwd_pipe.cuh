@@ -120,7 +120,8 @@ constexpr int PipeRingBytes(int d, int dv, int kks, int keys) {
   return (d / 64) * kPipeRows * 128 + kks * (d / 64) * keys * 128 + 2 * (dv / 64) * keys * 128;
 }
 
-template <int kSmWarps_, int kKS_, int kSB_, int kW_, int kDv_ = kW_>
+template <int kSmWarps_, int kKS_, int kSB_, int kW_, int kDv_ = kW_, bool kForceOneCta_ = false,
+          bool kForceKeys64_ = false, bool kAllowRowSumMma_ = true, int kQDiv_ = 2>
 struct Plan {
   static constexpr int kSmWarps = kSmWarps_;
   static constexpr int kKS = kKS_;  // K stages
@@ -130,33 +131,17 @@ struct Plan {
   static constexpr int kPipeWidthO = kDv_;       // Dv of the bucket: the N extent of O += P V
   static constexpr int kPipeSlabs = kW_ / 64;    // 64-column TMA slabs of Q and K per row
   static constexpr int kPipeSlabsV = kDv_ / 64;  // ... of V
-  // Resident CTAs per SM and keys per tile, from ONE budget rule over (D, Dv), not per shape:
-  //   two CTAs   when the score is at most kTwoCtaMaxWidth wide and O plus a 64-key S ring fit
-  //              in 256 TMEM columns (kDv + kSB * 64 <= 256): (64,64), (64,128), (128,64) and
-  //              (128,128); then 64 keys per tile and 256 columns each, so the two allocations
-  //              fit side by side in the SM's 512 (a 128-key tile would need kDv + 2*128 > 256).
-  //   one CTA    otherwise; then 128 keys per tile when TMEM (kDv + 2 * 128 <= 512, i.e. room for
-  //              O plus two 128-key S buffers) and the SMEM of a 128-key ring (PipeRingBytes) fit,
-  //              else 64: (256,256) is 65,536 + 2*4*16,384 + 2*4*16,384 = 327,680 B (64 keys).
-  //              The key-tile width is decided from the two-buffer budget on purpose, so that it
-  //              does not move when SBuffersFor (below) spends a third buffer: one rule gives the
-  //              width first and the S-ring depth second, and a deeper ring never narrows a tile.
-  // kTwoCtaMaxWidth is the rule's only measured input: 128, from the gate's rounds of the two-CTA
-  // form (D = 64: 15-22% over one CTA at 128 keys, in two paired rounds; D = 128:
-  // 4-8% on the D = 128 rows). D = 256 is excluded by the TMEM limb itself (256 + 128 > 256).
-  // XATTN_FWD_PIPE_ONE_CTA (a probe define, in no build) turns the two-CTA form off, for the
-  // paired measurement of the two forms.
 #if defined(XATTN_FWD_PIPE_ONE_CTA)
   static constexpr int kTwoCtaMaxWidth = 0;
 #else
-  static constexpr int kTwoCtaMaxWidth = 128;
+  static constexpr int kTwoCtaMaxWidth = kForceOneCta_ ? 0 : 128;
 #endif
   static constexpr bool kTwoCtas = kW_ <= kTwoCtaMaxWidth && kDv_ + kSB_ * 64 <= 256;  // TMEM limb
   static constexpr int kKeys =
-      kTwoCtas ? 64
-               : (kDv_ + 2 * 128 <= 512 && PipeRingBytes(kW_, kDv_, kKS_, 128) + 4096 <= 232448
-                      ? 128
-                      : 64);
+      (kTwoCtas || kForceKeys64_)
+          ? 64
+          : (kDv_ + 2 * 128 <= 512 && PipeRingBytes(kW_, kDv_, kKS_, 128) + 4096 <= 232448 ? 128
+                                                                                            : 64);
   static constexpr int kSmThreads = 32 * kSmWarps;
   static constexpr int kProducerWarp = kSmWarps;
   static constexpr int kMmaWarp = kSmWarps + 1;
@@ -182,18 +167,8 @@ struct Plan {
   // SMEM without the row sum's ones slabs (the layout below with kVStageBytes = kVTileBytes).
   static constexpr int kSmemBaseBytes =
       kVOff + kVS * kVTileBytes + ((kBarCount * 8 + 15) / 16) * 16 + 16 + 4 * 16 + kXchBytes;
-  // The softmax row sum on the tensor core, one budget rule over (D, Dv). It holds where the PV
-  // MMA may grow to N = Dv + 16 (N <= 256), the CTA's TMEM has those 16 columns beside O and the
-  // S ring, and SMEM has one more 64-column slab per V stage within the ceiling and the residency
-  // share. There each V stage carries a slab of 16-bit ones after its Dv / 64 TMA slabs, so the
-  // same PV instructions also accumulate L = P x ones into TMEM column Dv: the row sum of the very
-  // 16-bit P that O sums, with no extra MMA issue or commit. The softmax then drops its per-element
-  // row-sum adds and the 8-warp lsum exchange; L is rescaled with O. Today it takes (64,64),
-  // (128,64), (256,64) and (256,128); (128,128) and (64,128) have no free TMEM columns and every
-  // Dv = 256 bucket would need N > 256. A bucket whose TMEM columns go to another use (a second
-  // O block, or an S ring deepened to kSB 3 at two CTAs) takes no slab, by the same column limb.
   static constexpr bool kRowSumMma =
-      kDv_ + 16 <= 256 && kDv_ + 16 + kSB_ * kKeys <= (kTwoCtas ? 256 : 512) &&
+      kAllowRowSumMma_ && kDv_ + 16 <= 256 && kDv_ + 16 + kSB_ * kKeys <= (kTwoCtas ? 256 : 512) &&
       kSmemBaseBytes + kVS * kKvSlabBytes <= 232448 &&
       (kTwoCtas ? 2 : 1) * (kSmemBaseBytes + kVS * kKvSlabBytes + 1024) <= 233472;
   static constexpr int kVStageBytes = kVTileBytes + (kRowSumMma ? kKvSlabBytes : 0);
@@ -201,15 +176,6 @@ struct Plan {
   static constexpr int kSlotOff = kBarOff + ((kBarCount * 8 + 15) / 16) * 16;
   static constexpr int kRedOff = kSlotOff + 16;
   static constexpr int kXchOff = kRedOff + 4 * 16;          // 4 row warps x 4 int32
-  // No staged segment table: the k_segment plane is read at the mask test, in int64. A staged
-  // table would be 2 * kKeys * 8 B (int64) and a third K stage does not fit beside it, and it may
-  // not be narrowed to int32: the ids are the caller's - host.cc copies q_segment/k_segment as
-  // given, contiguity only, and `_segment_metadata.py` validates shape and dtype, not range - so
-  // ids that differ by 2^32, or an id whose low word is 0x80000000, would compare equal to each
-  // other or to a sentinel and a key of another segment would become visible (silent wrong y).
-  // Freeing the table entirely is what lets a third K stage fit the sm_103a SMEM ceiling, and it
-  // costs the timed rows nothing: a BOS-masked call hands the kernel no segment planes, so
-  // SegmentTest is false and the plane is never read there.
   static constexpr int kSmemBytes = kXchOff + kXchBytes;
   // TMEM columns: O at 0..Dv-1, then (kRowSumMma) L at Dv..Dv+15 (the PV accumulator's tail),
   // then the S ring.
@@ -218,20 +184,8 @@ struct Plan {
   static constexpr int kPvN = kPipeWidthO + (kRowSumMma ? 16 : 0);
   static constexpr int kSCol = kPvN;
   static constexpr int kBufCols = kKeys;
-  // Q resident in TMEM, one-CTA buckets only: the A operand of S = Q K^T is then a TMEM tile
-  // (the TS form PV already uses) instead of an SMEM descriptor, which is worth what the S group
-  // spends on the shared-memory read port: at N = 64 it reads 6 KB per 16-deep step, 48 cycles at
-  // 128 B/clk against 32 tensor cycles (a microbenchmark: S alone 952 cyc/tile in the real SS
-  // form, 516 with A in TMEM; the S+PV floor 1,265 -> 1,028). An A tile of kD half-precision dims
-  // is kD/2 columns (a TMEM lane holds 2 values per column), and 8 columns are consumed per 16-deep
-  // step. XATTN_H49_QDIV picks the arm: 0 the SS form (the shipped body, and every two-CTA bucket
-  // whatever it says), 2 full Q (all kD dims, kD/2 columns), 4 half Q (dims 0..kD/2-1 in TMEM,
-  // kD/4 columns, the rest SS - it keeps one more S buffer and halves the port pressure of A).
-#ifndef XATTN_H49_QDIV
-#define XATTN_H49_QDIV 2
-#endif
   static constexpr int kQWantCols =
-      (!kTwoCtas && XATTN_H49_QDIV) ? (kPipeWidth * 2 / XATTN_H49_QDIV) / 2 : 0;
+      (!kTwoCtas && kQDiv_ > 0) ? (kPipeWidth * 2 / kQDiv_) / 2 : 0;
   // Q's columns are spent only where the S ring keeps its two-buffer floor beside them and beside
   // O with its row-sum columns (kSCol = kPvN, which counts the 16 L columns where kRowSumMma): a bucket
   // whose kKeys leave less than that stays in the SS form (e.g. (64,256), whose 128-key buffers do
@@ -653,10 +607,15 @@ constexpr int SAheadFor() {
 }
 
 // ---------------------------------------------------------------- kernel
-template <class E, int kSmWarps, int kKS, int kSB, int kW, int kWv = kW>
-__global__ void __launch_bounds__(32 * (kSmWarps + 2), Plan<kSmWarps, kKS, kSB, kW, kWv>::kCtasPerSm)
-    PipeForwardKernel(const __grid_constant__ UmmaLaunchParams lp, const float rescale_thr) {
-  using Pl = Plan<kSmWarps, kKS, kSB, kW, kWv>;
+template <class E, int kSmWarps, int kKS, int kSB, int kW, int kWv = kW,
+          bool kForceOneCta = false, bool kForceKeys64 = false, bool kAllowRowSumMma = true,
+          int kQDiv = 2>
+__global__ void __launch_bounds__(
+    32 * (kSmWarps + 2),
+    Plan<kSmWarps, kKS, kSB, kW, kWv, kForceOneCta, kForceKeys64, kAllowRowSumMma, kQDiv>::kCtasPerSm)
+    PipeForwardKernel(const __grid_constant__ UmmaLaunchParams lp, const float rescale_thr,
+                      const int grid_mode) {
+  using Pl = Plan<kSmWarps, kKS, kSB, kW, kWv, kForceOneCta, kForceKeys64, kAllowRowSumMma, kQDiv>;
   constexpr int kHalves = kSmWarps / 4;
   constexpr int kCols = Pl::kKeys / kHalves;         // S columns per softmax thread
   constexpr int kOCols = Pl::kPipeWidthO / kHalves;  // O columns per softmax thread
@@ -686,9 +645,38 @@ __global__ void __launch_bounds__(32 * (kSmWarps + 2), Plan<kSmWarps, kKS, kSB, 
   const int tid = threadIdx.x;
   const int warp = tid >> 5;
   const int lane = tid & 31;
-  const int64_t b = blockIdx.z;
-  const int64_t hq = blockIdx.y;
-  const int qt = blockIdx.x;
+  int64_t b = 0, hq = 0;
+  int qt = 0;
+  if (grid_mode == 0) {
+    // Original grid(nqt, Hq, B)
+    qt = blockIdx.x;
+    hq = blockIdx.y;
+    b = blockIdx.z;
+  } else if (grid_mode == 1) {
+    // KV-group-major grid(Hq, nqt, B) descending (b, qt)
+    hq = blockIdx.x;
+    qt = static_cast<int>(gridDim.y - 1u - blockIdx.y);
+    b = static_cast<int64_t>(gridDim.z - 1u - blockIdx.z);
+  } else {
+    // KV-head tiled grid(nqt * Hq, B): (gh, qt_in_chunk, kvh, desc qt_chunk, desc b)
+    const int nqt = static_cast<int>((p.q_length + kPipeRows - 1) / kPipeRows);
+    const int G = static_cast<int>(p.group > 0 ? p.group : 1);
+    const int Hkv = static_cast<int>(p.query_heads / G);
+    const int lin = static_cast<int>(blockIdx.x);
+    constexpr int kChunkQt = 16;
+    const int ctas_per_chunk = kChunkQt * static_cast<int>(p.query_heads);
+    const int chunk_idx = lin / ctas_per_chunk;
+    const int rem = lin % ctas_per_chunk;
+    const int qt_start = chunk_idx * kChunkQt;
+    const int qt_cnt = min(kChunkQt, nqt - qt_start);
+    const int kvh_i = rem / (qt_cnt * G);
+    const int rem2 = rem % (qt_cnt * G);
+    const int qt_off = rem2 / G;
+    const int gh_i = rem2 % G;
+    hq = static_cast<int64_t>(kvh_i * G + gh_i);
+    qt = nqt - 1 - (qt_start + qt_off);
+    b = static_cast<int64_t>(gridDim.y - 1u - blockIdx.y);
+  }
   const int64_t kvh = p.group > 0 ? hq / p.group : hq;
   auto bar = [&](int idx) -> uint32_t { return bar0 + 8u * static_cast<uint32_t>(idx); };
 
@@ -1089,7 +1077,11 @@ __global__ void __launch_bounds__(32 * (kSmWarps + 2), Plan<kSmWarps, kKS, kSB, 
       // With kSB = kSAhead + 1 that reader is PV(j - 1), issued moments before, so every tile pays
       // its commit-to-wake latency with the pipe idle; with kSB = kSAhead + 2 it is PV(j - 2),
       // retired a whole iteration earlier, and the reuse wait is met on arrival.
-      constexpr int kSAhead = SAheadFor<kW, kWv>();
+      constexpr int kSAhead =
+          (Pl::kCtasPerSm == 1 && Pl::kSCol + Pl::kQTmemCols + 3 * Pl::kKeys <= Pl::kAllocCols &&
+           kSB >= 3)
+              ? 2
+              : 1;
       static_assert(kSAhead >= 1 && kSAhead + 1 <= kSB, "S ring must hold the issue distance");
       for (int p = 0; p < kSAhead && p < n; ++p) issue_s(p);
       if (lane == 0) XFT(3);
@@ -1511,6 +1503,621 @@ __global__ void __launch_bounds__(32 * (kSmWarps + 2), Plan<kSmWarps, kKS, kSB, 
   if (warp == Pl::kMmaWarp) TmemDealloc(tbase, Pl::kAllocCols);  // the allocating warp
 }
 
+// ---------------------------------------------------------------- persistent 2-CTA/SM kernel
+// Persistent 2-CTA/SM forward kernel for D=128, Dv=128 (kSmWarps=4, kSB=2, kKeys=64):
+//   - TmemAlloc/TmemDealloc and MbarInit executed ONCE per persistent CTA (~296 CTAs on B300)
+//   - LJF + KV-head-tiled scheduling with dynamic work-stealing (zero SM tail imbalance, 100%
+//     bitwise deterministic since each (b, qt, hq) tile is an independent single-writer output)
+//   - Inter-tile overlap: epilogue stages O into `sv`, freeing `sq` as soon as S(n-1) completes
+//     so Producer prefetches Q(T+1) + K0(T+1) and MMA issues S0(T+1) DURING Epilogue(T)
+//   - Warp-uniform softmax fast paths (warp_no_vis skip, warp_all_vis Ffma2, half-tile skip)
+// Self-resetting persistent work-stealing counters (zero workspace, zero memset kernel).
+static __device__ unsigned int g_fwd_work_counter = 0u;
+static __device__ unsigned int g_fwd_done_ctas = 0u;
+
+struct PersistTileInfo {
+  int32_t b;
+  int32_t qt;
+  int32_t hq;
+  int32_t kvh;
+  int32_t t0;
+  int32_t t1;
+  int32_t n;
+  int32_t max_lo;
+  int32_t min_hi;
+  int32_t valid;
+};
+
+template <int kKS_, int kW_, int kWv_>
+struct PersistPlan {
+  static constexpr int kSmWarps = 4;
+  static constexpr int kKS = kKS_;
+  static constexpr int kVS = 2;
+  static constexpr int kSB = 2;
+  static constexpr int kKeys = 64;
+  static constexpr int kPipeWidth = kW_;
+  static constexpr int kPipeWidthO = kWv_;
+  static constexpr int kPipeSlabs = kW_ / 64;
+  static constexpr int kPipeSlabsV = kWv_ / 64;
+  static constexpr int kSmThreads = 32 * kSmWarps;
+  static constexpr int kProducerWarp = kSmWarps;
+  static constexpr int kMmaWarp = kSmWarps + 1;
+  static constexpr int kThreads = 32 * (kSmWarps + 2);
+  static constexpr int kCtasPerSm = 2;
+  static constexpr int kAllocCols = 256;
+  static constexpr int kOCol = 0;
+  static constexpr int kSCol = kPipeWidthO;
+  static constexpr int kBufCols = kKeys;
+  static constexpr int kQSlabBytes = kPipeRows * 128;
+  static constexpr int kKvSlabBytes = kKeys * 128;
+  static constexpr int kQBytes = kPipeSlabs * kQSlabBytes;
+  static constexpr int kKTileBytes = kPipeSlabs * kKvSlabBytes;
+  static constexpr int kVTileBytes = kPipeSlabsV * kKvSlabBytes;
+  static constexpr int kQOff = 0;
+  static constexpr int kKOff = kQOff + kQBytes;
+  static constexpr int kVOff = kKOff + kKS * kKTileBytes;
+  static constexpr int kBarQ = 0;
+  static constexpr int kBarQEmpty = 1;
+  static constexpr int kBarOStoreDone = 2;
+  static constexpr int kBarTile = 3;  // 4 slots
+  static constexpr int kBarKFull = 7;
+  static constexpr int kBarKEmpty = kBarKFull + kKS;
+  static constexpr int kBarVFull = kBarKEmpty + kKS;
+  static constexpr int kBarVEmpty = kBarVFull + kVS;
+  static constexpr int kBarS = kBarVEmpty + kVS;
+  static constexpr int kBarP = kBarS + kSB;
+  static constexpr int kBarPv = kBarP + kSB;
+  static constexpr int kBarCount = kBarPv + kSB;
+  static constexpr int kBarOff = kVOff + kVS * kVTileBytes;
+  static constexpr int kSlotOff = kBarOff + ((kBarCount * 8 + 15) / 16) * 16;
+  static constexpr int kTileRingOff = kSlotOff + 16;
+  static constexpr int kSmemBytes = kTileRingOff + 4 * static_cast<int>(sizeof(PersistTileInfo));
+  static_assert(kOCol + kPipeWidthO + kSB * kBufCols <= kAllocCols, "TMEM budget");
+  static_assert(kCtasPerSm * (kSmemBytes + 1024) <= 233472, "2-CTA SMEM budget");
+  static_assert(kPipeRows * kPipeWidthO * 2 <= kVS * kVTileBytes, "O stage fits in sv");
+};
+
+__device__ __forceinline__ PersistTileInfo DecodePersistWork(const UmmaLaunchParams& lp,
+                                                             int work_id) {
+  constexpr int kChunkQ = 96;
+  const Params& p = lp.params;
+  const int B = static_cast<int>(p.batch);
+  const int nqt = static_cast<int>((p.q_length + kPipeRows - 1) / kPipeRows);
+  const int total_q = B * nqt;
+  const int Hq = static_cast<int>(p.query_heads);
+  const int G = static_cast<int>(p.group > 0 ? p.group : 1);
+
+  int b = 0, qt = 0, hq = 0, kvh_i = 0;
+  if (lp.maps.fwd_ljf_order != nullptr) {
+    const int ctas_per_chunk = kChunkQ * Hq;
+    const int chunk_idx = work_id / ctas_per_chunk;
+    const int rem = work_id % ctas_per_chunk;
+    const int r_start = chunk_idx * kChunkQ;
+    const int r_cnt = min(kChunkQ, total_q - r_start);
+    kvh_i = rem / (r_cnt * G);
+    const int rem2 = rem % (r_cnt * G);
+    const int r_off = rem2 / G;
+    const int gh_i = rem2 % G;
+    const int rank = r_start + r_off;
+    const int bqt = lp.maps.fwd_ljf_order[rank];
+    b = bqt / nqt;
+    qt = bqt % nqt;
+    hq = kvh_i * G + gh_i;
+  } else {
+    // Dense (no bos_mask): exact LJF across batches — large chunk on full-window tiles
+    // (qt >= 64) for maximum L2 K/V sharing, and fine chunk (8) on the short ramp (qt < 64) so
+    // the final wave consists purely of the shortest ramp tiles (qt = 0..7).
+    const int ramp_n = min(nqt, 64);
+    const int flat_n = nqt - ramp_n;
+    const int flat_tiles = flat_n * B * Hq;
+    if (work_id < flat_tiles) {
+      const int ctas_per_qchunk = kChunkQ * B * Hq;
+      const int qchunk_idx = work_id / ctas_per_qchunk;
+      const int rem = work_id % ctas_per_qchunk;
+      const int q_start = qchunk_idx * kChunkQ;
+      const int q_cnt = min(kChunkQ, flat_n - q_start);
+      const int b_stride = q_cnt * Hq;
+      b = rem / b_stride;
+      const int rem_b = rem % b_stride;
+      kvh_i = rem_b / (q_cnt * G);
+      const int rem_k = rem_b % (q_cnt * G);
+      const int q_off = rem_k / G;
+      const int gh_i = rem_k % G;
+      qt = nqt - 1 - (q_start + q_off);
+      hq = kvh_i * G + gh_i;
+    } else {
+      const int r_wid = work_id - flat_tiles;
+      constexpr int r_chunk = 8;
+      const int ctas_per_qchunk = r_chunk * B * Hq;
+      const int qchunk_idx = r_wid / ctas_per_qchunk;
+      const int rem = r_wid % ctas_per_qchunk;
+      const int q_start = qchunk_idx * r_chunk;
+      const int q_cnt = min(r_chunk, ramp_n - q_start);
+      const int b_stride = q_cnt * Hq;
+      b = rem / b_stride;
+      const int rem_b = rem % b_stride;
+      kvh_i = rem_b / (q_cnt * G);
+      const int rem_k = rem_b % (q_cnt * G);
+      const int q_off = rem_k / G;
+      const int gh_i = rem_k % G;
+      qt = ramp_n - 1 - (q_start + q_off);
+      hq = kvh_i * G + gh_i;
+    }
+  }
+
+  const int64_t q_row0 = static_cast<int64_t>(qt) * kPipeRows;
+  const int64_t q_last = min(q_row0 + kPipeRows - 1, p.q_length - 1);
+  const int64_t shift = p.total_length - p.q_length;
+  const int t1 = static_cast<int>(min(q_last + shift, p.total_length - 1) / 64);
+  int min_lo, max_lo, min_hi;
+  if (lp.maps.tile128_bounds_ready && p.tile_bounds != nullptr) {
+    const int64_t bqt = int64_t(b) * nqt + qt;
+    const int4 tb = reinterpret_cast<const int4*>(p.tile_bounds + bqt * 4)[0];
+    min_lo = tb.x;
+    max_lo = tb.z;
+    min_hi = tb.w;
+  } else {
+    const int64_t pos0 = q_row0 + shift;
+    const int64_t lo0 = max(int64_t{0}, (pos0 / p.chunk - 1) * p.chunk);
+    const int64_t pos1 = q_last + shift;
+    const int64_t lo1 = max(int64_t{0}, (pos1 / p.chunk - 1) * p.chunk);
+    const bool full_rows = (q_row0 + kPipeRows <= p.q_length);
+    min_lo = static_cast<int>(lo0);
+    max_lo = full_rows ? static_cast<int>(lo1) : INT_MAX;
+    min_hi = full_rows ? static_cast<int>(min(pos0, p.total_length - 1)) : -1;
+  }
+  const int t0 = min_lo / 64;
+  return PersistTileInfo{b, qt, hq, kvh_i, t0, t1, t1 - t0 + 1, max_lo, min_hi, 1};
+}
+
+template <class E, int kKS, int kW, int kWv>
+__global__ void __launch_bounds__(32 * 6, 2)
+    PipeForwardPersistentKernel(const __grid_constant__ UmmaLaunchParams lp,
+                                const float rescale_thr, const int total_tiles) {
+  using Pl = PersistPlan<kKS, kW, kWv>;
+  constexpr int kCols = 64;
+  constexpr int kOCols = Pl::kPipeWidthO;
+  const Params& p = lp.params;
+  extern __shared__ __align__(1024) unsigned char smem[];
+
+  unsigned char* const sq = smem + Pl::kQOff;
+  unsigned char* const sk = smem + Pl::kKOff;
+  unsigned char* const sv = smem + Pl::kVOff;
+  const uint32_t bar0 = SmemAddr(smem + Pl::kBarOff);
+  uint32_t* const tmem_slot = reinterpret_cast<uint32_t*>(smem + Pl::kSlotOff);
+  PersistTileInfo* const tile_ring = reinterpret_cast<PersistTileInfo*>(smem + Pl::kTileRingOff);
+
+  const int tid = threadIdx.x;
+  const int warp = tid >> 5;
+  const int lane = tid & 31;
+  auto bar = [&](int idx) -> uint32_t { return bar0 + 8u * static_cast<uint32_t>(idx); };
+
+  // One-time CTA setup: init mbarriers & allocate TMEM once for all tiles this CTA processes.
+  if (warp == Pl::kMmaWarp) {
+    if (lane == 0) {
+      if ((SmemAddr(smem) & 1023u) != 0u) __trap();
+      for (int x = 0; x < Pl::kBarCount; ++x) {
+        const bool is_p = x >= Pl::kBarP && x < Pl::kBarP + Pl::kSB;
+        MbarInit(bar(x), is_p ? Pl::kSmThreads : 1);
+      }
+      MbarInitFence();
+    }
+    __syncwarp();
+    TmemAlloc(Pl::kAllocCols, tmem_slot);
+    TmemRelinquish();
+  }
+  TmemFenceBeforeSync();
+  __syncthreads();
+  TmemFenceAfterSync();
+  const uint32_t tbase = *tmem_slot & 0x1FFu;
+
+  if (warp == Pl::kProducerWarp) {
+    // ------------------------------------------------------------ Persistent TMA producer
+    if (lane == 0) {
+      RingPos<kKS> k_pos;
+      RingPos<Pl::kVS> v_pos;
+      int k_step = 0;
+      int v_step = 0;
+      unsigned int* const cnt_ptr =
+          (lp.maps.fwd_counter != nullptr) ? lp.maps.fwd_counter : &g_fwd_work_counter;
+      for (int tile_t = 0;; ++tile_t) {
+        const int wid = static_cast<int>(atomicAdd(cnt_ptr, 1u));
+        const int slot = tile_t & 3;
+        if (wid >= total_tiles) {
+          tile_ring[slot].valid = 0;
+          Arrive(bar(Pl::kBarTile + slot));
+          break;
+        }
+        const PersistTileInfo ti = DecodePersistWork(lp, wid);
+        tile_ring[slot] = ti;
+        Arrive(bar(Pl::kBarTile + slot));
+
+        // Wait until MMA finished the last S of previous tile before overwriting sq.
+        if (tile_t > 0) MbarWait(bar(Pl::kBarQEmpty), static_cast<uint32_t>((tile_t - 1) & 1));
+        MbarArriveExpectTx(bar(Pl::kBarQ), Pl::kQBytes);
+#pragma unroll
+        for (int s = 0; s < Pl::kPipeSlabs; ++s) {
+#pragma unroll
+          for (int r = 0; r < kPipeRows; r += kTmaRows) {
+            TmaLoad4D(sq + s * Pl::kQSlabBytes + r * 128, &lp.maps.q, bar(Pl::kBarQ), s * 64,
+                      ti.hq, ti.qt * kPipeRows + r, ti.b);
+          }
+        }
+
+        auto load_k = [&](int j) {
+          if (k_step >= kKS) MbarWait(bar(Pl::kBarKEmpty + k_pos.st), k_pos.ph ^ 1u);
+          const CUtensorMap* kmap;
+          const CUtensorMap* vmap;
+          int row0;
+          ResolveKeyMap(lp, static_cast<int64_t>(ti.t1 - j) * Pl::kKeys, &kmap, &vmap, &row0);
+          unsigned char* const dst = sk + k_pos.st * Pl::kKTileBytes;
+          MbarArriveExpectTx(bar(Pl::kBarKFull + k_pos.st), static_cast<uint32_t>(Pl::kKTileBytes));
+#pragma unroll
+          for (int s = 0; s < Pl::kPipeSlabs; ++s) {
+            TmaLoad4D(dst + s * Pl::kKvSlabBytes, kmap, bar(Pl::kBarKFull + k_pos.st), s * 64,
+                      ti.kvh, row0, ti.b);
+          }
+          k_pos.Next();
+          ++k_step;
+        };
+        auto load_v = [&](int j) {
+          if (v_step >= Pl::kVS) MbarWait(bar(Pl::kBarVEmpty + v_pos.st), v_pos.ph ^ 1u);
+          const CUtensorMap* kmap;
+          const CUtensorMap* vmap;
+          int row0;
+          ResolveKeyMap(lp, static_cast<int64_t>(ti.t1 - j) * Pl::kKeys, &kmap, &vmap, &row0);
+          unsigned char* const dst = sv + v_pos.st * Pl::kVTileBytes;
+          MbarArriveExpectTx(bar(Pl::kBarVFull + v_pos.st), static_cast<uint32_t>(Pl::kVTileBytes));
+#pragma unroll
+          for (int s = 0; s < Pl::kPipeSlabsV; ++s) {
+            TmaLoad4D(dst + s * Pl::kKvSlabBytes, vmap, bar(Pl::kBarVFull + v_pos.st), s * 64,
+                      ti.kvh, row0, ti.b);
+          }
+          v_pos.Next();
+          ++v_step;
+        };
+
+        // Prefetch K(0 .. kKS-2) immediately (while previous tile's epilogue is still reading sv!).
+        int jk = 0;
+        for (; jk < ti.n && jk < kKS - 1; ++jk) load_k(jk);
+        // Wait until previous tile's epilogue TMA store finished reading sv before loading V(0).
+        if (tile_t > 0) MbarWait(bar(Pl::kBarOStoreDone), static_cast<uint32_t>((tile_t - 1) & 1));
+        for (int j = 0; j < ti.n; ++j) {
+          if (jk < ti.n) {
+            load_k(jk);
+            ++jk;
+          }
+          load_v(j);
+        }
+      }
+    }
+    __syncwarp();
+  } else if (warp == Pl::kMmaWarp) {
+    // ------------------------------------------------------------ Persistent MMA issuer
+    const int fmt = ElemTraits<E>::kFormat;
+    const uint32_t s_idesc = MakeInstrDesc(fmt, kPipeRows, Pl::kKeys, /*a_major=*/0, /*b_major=*/0);
+    const uint32_t pv_idesc =
+        MakeInstrDesc(fmt, kPipeRows, Pl::kPipeWidthO, /*a_major=*/0, /*b_major=*/1);
+    const uint64_t q_desc = MakeSmemDesc(SmemAddr(sq)).value;
+    const uint64_t k_desc0 = MakeSmemDesc(SmemAddr(sk)).value;
+    const uint64_t v_desc0 =
+        MakeSmemDesc(SmemAddr(sv), static_cast<uint32_t>(Pl::kKeys * 8), 64u).value;
+
+    RingPos<kKS> s_k;
+    RingPos<Pl::kSB> s_b;
+    RingPos<Pl::kVS> p_v;
+    RingPos<Pl::kSB> p_b;
+    int s_step = 0;
+
+    auto issue_s = [&](bool is_last_s) {
+      const int st = s_k.st;
+      const int buf = s_b.st;
+      MbarWait(bar(Pl::kBarKFull + st), s_k.ph);
+      if (s_step >= Pl::kSB) MbarWait(bar(Pl::kBarPv + buf), s_b.ph ^ 1u);
+      TmemFenceAfterSync();
+      __syncwarp();
+      const uint64_t kd = k_desc0 + static_cast<uint64_t>(st * (Pl::kKTileBytes >> 4));
+      const uint32_t dst = tbase + Pl::kSCol + buf * Pl::kBufCols;
+      constexpr int kSSteps = Pl::kPipeWidth / 16;
+      if (ElectOne()) {
+#pragma unroll
+        for (int kk = 0; kk < kSSteps; ++kk) {
+          const int slab = kk >> 2, within = kk & 3;
+          const uint64_t ad =
+              q_desc + static_cast<uint64_t>((slab * Pl::kQSlabBytes + within * 32) >> 4);
+          const uint64_t bd =
+              kd + static_cast<uint64_t>((slab * Pl::kKvSlabBytes + within * 32) >> 4);
+          FwdMmaSsRaw(dst, ad, bd, s_idesc, kk == 0 ? 0u : 1u);
+        }
+        FwdMmaCommitRaw(bar(Pl::kBarKEmpty + st));
+        FwdMmaCommitRaw(bar(Pl::kBarS + buf));
+        if (is_last_s) FwdMmaCommitRaw(bar(Pl::kBarQEmpty));
+      }
+      s_k.Next();
+      s_b.Next();
+      ++s_step;
+    };
+    auto issue_pv = [&](int j_tile) {
+      const int st = p_v.st;
+      const int buf = p_b.st;
+      MbarWait(bar(Pl::kBarP + buf), p_b.ph);
+      MbarWait(bar(Pl::kBarVFull + st), p_v.ph);
+      TmemFenceAfterSync();
+      __syncwarp();
+      const uint64_t vd = v_desc0 + static_cast<uint64_t>(st * (Pl::kVTileBytes >> 4));
+      const uint32_t scol = tbase + Pl::kSCol + buf * Pl::kBufCols;
+      if (ElectOne()) {
+#pragma unroll
+        for (int kk = 0; kk < Pl::kKeys / 16; ++kk) {
+          FwdMmaTsRaw(tbase + Pl::kOCol, PCol<4, kCols>(scol, kk),
+                      vd + static_cast<uint64_t>((kk * 16 * 128) >> 4), pv_idesc,
+                      (j_tile == 0 && kk == 0) ? 0u : 1u);
+        }
+        FwdMmaCommitRaw(bar(Pl::kBarVEmpty + st));
+        FwdMmaCommitRaw(bar(Pl::kBarPv + buf));
+      }
+      p_v.Next();
+      p_b.Next();
+    };
+
+    for (int tile_t = 0;; ++tile_t) {
+      const int slot = tile_t & 3;
+      MbarWait(bar(Pl::kBarTile + slot), static_cast<uint32_t>((tile_t >> 2) & 1));
+      if (tile_ring[slot].valid == 0) break;
+      const int n = tile_ring[slot].n;
+      MbarWait(bar(Pl::kBarQ), static_cast<uint32_t>(tile_t & 1));
+      issue_s(/*is_last_s=*/(n == 1));
+      for (int j = 0; j < n; ++j) {
+        if (j + 1 < n) issue_s(/*is_last_s=*/(j + 1 == n - 1));
+        issue_pv(j);
+      }
+    }
+  } else {
+    // ------------------------------------------------------------ Persistent softmax warps (0..3)
+    const int g = warp;
+    const int row = 32 * g + lane;
+    const uint32_t lane_base = static_cast<uint32_t>(32 * g) << 16;
+    const float sl2 = p.scale_log2;
+    const float2 sl2x2 = make_float2(sl2, sl2);
+    const bool vec_v = (p.value_dim == Pl::kPipeWidthO);
+
+    RingPos<Pl::kSB> sm_cur;
+    RingPos<Pl::kSB> sm_prev;
+
+    for (int tile_t = 0;; ++tile_t) {
+      const int slot = tile_t & 3;
+      MbarWait(bar(Pl::kBarTile + slot), static_cast<uint32_t>((tile_t >> 2) & 1));
+      const PersistTileInfo ti = tile_ring[slot];
+      if (ti.valid == 0) break;
+
+      const int64_t i = static_cast<int64_t>(ti.qt) * kPipeRows + row;
+      const bool row_in_range = i < p.q_length;
+      const detail::Bounds bd = detail::RowBounds(p, ti.b, i);
+      const bool live = row_in_range && bd.lo <= bd.hi;
+
+      float m_used = -INFINITY;
+      float lsum = 0.f;
+
+      for (int j = 0; j < ti.n; ++j) {
+        const int buf = sm_cur.st;
+        const int kb = (ti.t1 - j) * Pl::kKeys;
+        const uint32_t scol = tbase + Pl::kSCol + buf * Pl::kBufCols;
+        MbarWait(bar(Pl::kBarS + buf), sm_cur.ph);
+        TmemFenceAfterSync();
+
+        bool use_full = (kb >= ti.max_lo && kb + Pl::kKeys - 1 <= ti.min_hi);
+        int lo_c = 0, hi_c = 63;
+        if (!use_full) {
+          lo_c = live ? bd.lo - kb : 1;
+          hi_c = live ? bd.hi - kb : 0;
+          if (__all_sync(0xffffffffu, !live || lo_c > 63 || hi_c < 0)) {
+            uint32_t pk[32];
+#pragma unroll
+            for (int k = 0; k < 32; ++k) pk[k] = 0u;
+            TmemStore32(lane_base | scol, pk);
+            TmemWaitSt();
+            TmemFenceBeforeSync();
+            Arrive(bar(Pl::kBarP + buf));
+            sm_prev = sm_cur;
+            sm_cur.Next();
+            continue;
+          }
+          use_full = __all_sync(0xffffffffu, live && lo_c <= 0 && hi_c >= 63);
+        }
+
+        float s[kCols];
+        Ld64(lane_base | scol, s);
+
+        float tmax = -INFINITY;
+        if (use_full) {
+          // 4-accumulator contiguous-triplet FMNMX3 reduction: s[c], s[c+1], s[c+2] sit in
+          // 3 distinct mod-4 banks (0 bank conflicts) while using only 4 live accumulator regs.
+          float e0 = fmaxf(fmaxf(s[0], s[1]), s[2]);
+          float e1 = fmaxf(fmaxf(s[3], s[4]), s[5]);
+          float e2 = fmaxf(fmaxf(s[6], s[7]), s[8]);
+          float e3 = fmaxf(fmaxf(s[9], s[10]), s[11]);
+#pragma unroll
+          for (int c = 12; c < 60; c += 12) {
+            e0 = fmaxf(e0, fmaxf(fmaxf(s[c + 0], s[c + 1]), s[c + 2]));
+            e1 = fmaxf(e1, fmaxf(fmaxf(s[c + 3], s[c + 4]), s[c + 5]));
+            e2 = fmaxf(e2, fmaxf(fmaxf(s[c + 6], s[c + 7]), s[c + 8]));
+            e3 = fmaxf(e3, fmaxf(fmaxf(s[c + 9], s[c + 10]), s[c + 11]));
+          }
+          e0 = fmaxf(e0, fmaxf(s[60], s[61]));
+          e1 = fmaxf(e1, fmaxf(s[62], s[63]));
+          tmax = fmaxf(fmaxf(e0, e1), fmaxf(e2, e3)) * sl2;
+        } else {
+          uint32_t vis[2];
+#pragma unroll
+          for (int w = 0; w < 2; ++w) {
+            const int lo = min(max(lo_c - 32 * w, 0), 32);
+            const int hi = min(max(hi_c - 32 * w, -1), 31);
+            vis[w] = lo > hi ? 0u : ((0xffffffffu >> (31 - hi)) & (0xffffffffu << lo));
+          }
+#pragma unroll
+          for (int c = 0; c < kCols; c += 2) {
+            const float2 x = Fmul2(make_float2(s[c], s[c + 1]), sl2x2);
+            s[c] = (vis[c / 32] & (1u << (c % 32))) ? x.x : -INFINITY;
+            s[c + 1] = (vis[c / 32] & (1u << ((c + 1) % 32))) ? x.y : -INFINITY;
+            tmax = fmaxf(tmax, fmaxf(s[c], s[c + 1]));
+          }
+        }
+
+        const bool vis_tile = tmax > -INFINITY;
+        const bool first = vis_tile && m_used == -INFINITY;
+        const bool need = vis_tile && !first && tmax > m_used + rescale_thr;
+        const bool any_need = __any_sync(0xffffffffu, need);
+        float alpha = 1.f;
+        if (any_need) {
+          const float a = Ex2(m_used - tmax);
+          alpha = need ? a : 1.f;
+        }
+        m_used = (first || need) ? tmax : m_used;
+        const float mneg = vis_tile ? -m_used : 0.f;
+        const float2 mx2 = make_float2(mneg, mneg);
+
+        uint32_t pk[32];
+        float2 acc0 = make_float2(0.f, 0.f), acc1 = make_float2(0.f, 0.f);
+        if (use_full) {
+#pragma unroll
+          for (int c = 0; c < kCols; c += 4) {
+            const float2 y01 = Ffma2(make_float2(s[c + 0], s[c + 1]), sl2x2, mx2);
+            const float2 y23 = Ffma2(make_float2(s[c + 2], s[c + 3]), sl2x2, mx2);
+            const float2 e01 = make_float2(Ex2(y01.x), Ex2(y01.y));
+            const float2 e23 = make_float2(Ex2(y23.x), Ex2(y23.y));
+            acc0 = Fadd2(acc0, e01);
+            acc1 = Fadd2(acc1, e23);
+            pk[c / 2] = PackOf<E>::Pack2(e01.x, e01.y);
+            pk[c / 2 + 1] = PackOf<E>::Pack2(e23.x, e23.y);
+          }
+        } else {
+#pragma unroll
+          for (int c = 0; c < kCols; c += 4) {
+            const float2 y01 = Fadd2(make_float2(s[c + 0], s[c + 1]), mx2);
+            const float2 y23 = Fadd2(make_float2(s[c + 2], s[c + 3]), mx2);
+            const float2 e01 = make_float2(Ex2(y01.x), Ex2(y01.y));
+            const float2 e23 = make_float2(Ex2(y23.x), Ex2(y23.y));
+            acc0 = Fadd2(acc0, e01);
+            acc1 = Fadd2(acc1, e23);
+            pk[c / 2] = PackOf<E>::Pack2(e01.x, e01.y);
+            pk[c / 2 + 1] = PackOf<E>::Pack2(e23.x, e23.y);
+          }
+        }
+        lsum = lsum * alpha + ((acc0.x + acc0.y) + (acc1.x + acc1.y));
+        TmemStore32(lane_base | scol, pk);
+
+        if (any_need) {
+          MbarWait(bar(Pl::kBarPv + sm_prev.st), sm_prev.ph);
+          TmemFenceAfterSync();
+          const float a = need ? alpha : 1.f;
+          const bool clear = need && alpha == 0.f;
+#pragma unroll 1
+          for (int c = 0; c < kOCols; c += 64) {
+            float o[64];
+            Ld64(lane_base | (tbase + Pl::kOCol + c), o);
+            uint32_t w0[32], w1[32];
+            const float2 a2 = make_float2(a, a);
+#pragma unroll
+            for (int x = 0; x < 16; ++x) {
+              const float2 p0 = Fmul2(make_float2(o[2 * x], o[2 * x + 1]), a2);
+              const float2 p1 = Fmul2(make_float2(o[32 + 2 * x], o[32 + 2 * x + 1]), a2);
+              w0[2 * x] = __float_as_uint(clear ? 0.f : p0.x);
+              w0[2 * x + 1] = __float_as_uint(clear ? 0.f : p0.y);
+              w1[2 * x] = __float_as_uint(clear ? 0.f : p1.x);
+              w1[2 * x + 1] = __float_as_uint(clear ? 0.f : p1.y);
+            }
+            TmemStore32(lane_base | (tbase + Pl::kOCol + c), w0);
+            TmemStore32(lane_base | (tbase + Pl::kOCol + c + 32), w1);
+          }
+        }
+        TmemWaitSt();
+        TmemFenceBeforeSync();
+        Arrive(bar(Pl::kBarP + buf));
+        sm_prev = sm_cur;
+        sm_cur.Next();
+      }
+
+      // -------------------------------------------------------------- Epilogue (stages into sv!)
+      const float inv = lsum > 0.f ? 1.f / lsum : 0.f;
+      MbarWait(bar(Pl::kBarPv + sm_prev.st), sm_prev.ph);
+      TmemFenceAfterSync();
+      E* const stage = reinterpret_cast<E*>(sv);
+      constexpr int kSlabElems = kPipeRows * 64;
+#pragma unroll 1
+      for (int s = 0; s < Pl::kPipeSlabsV; ++s) {
+        float o[64];
+        Ld64(lane_base | (tbase + Pl::kOCol + s * 64), o);
+        if (row_in_range) {
+          E* const slabrow = stage + s * kSlabElems + row * 64;
+          uint4* const chunks = reinterpret_cast<uint4*>(slabrow);
+          const int swz = row & 7;
+          if (!live) {
+            const uint4 z = make_uint4(0u, 0u, 0u, 0u);
+#pragma unroll
+            for (int k = 0; k < 8; ++k) chunks[k ^ swz] = z;
+          } else if (vec_v) {
+            const float2 inv2 = make_float2(inv, inv);
+#pragma unroll
+            for (int half = 0; half < 2; ++half) {
+              union {
+                uint4 u4[4];
+                uint32_t w[16];
+              } pk;
+              const int base_x = half * 32;
+#pragma unroll
+              for (int x = 0; x < 16; ++x) {
+                const float2 m2 = Fmul2(make_float2(o[base_x + 2 * x], o[base_x + 2 * x + 1]), inv2);
+                pk.w[x] = PackOf<E>::Pack2(m2.x, m2.y);
+              }
+#pragma unroll
+              for (int k = 0; k < 4; ++k) chunks[(half * 4 + k) ^ swz] = pk.u4[k];
+            }
+          } else {
+#pragma unroll
+            for (int x = 0; x < 64; ++x) {
+              const int ccx = s * 64 + x;
+              if (ccx >= p.value_dim) break;
+              slabrow[(((x >> 3) ^ swz) << 3) | (x & 7)] = PackOf<E>::From(o[x] * inv);
+            }
+          }
+        }
+        FenceProxyAsyncShared();
+        NamedSync(kSmBarrierId, Pl::kSmThreads);
+        if (row == 0) {
+          const uint32_t sbase = SmemAddr(stage);
+#pragma unroll
+          for (int r = 0; r < kPipeRows; r += kTmaRows) {
+            TmaStoreAtom(&lp.maps.y, sbase + static_cast<uint32_t>((s * kPipeRows + r) * 128),
+                         s * 64, ti.hq, ti.qt * kPipeRows + r, ti.b);
+          }
+          TmaStoreCommit();
+        }
+      }
+      if (row_in_range && p.lse != nullptr) {
+        p.lse[(int64_t(ti.b) * p.query_heads + ti.hq) * p.q_length + i] =
+            (live && lsum > 0.f) ? (0.6931471805599453f * m_used + __logf(lsum)) : -INFINITY;
+      }
+      if (row == 0) {
+        TmaStoreWaitRead();
+        Arrive(bar(Pl::kBarOStoreDone));
+      }
+    }
+  }
+
+  // ------------------------------------------------------------------ Persistent exit
+  TmemFenceBeforeSync();
+  __syncthreads();
+  TmemFenceAfterSync();
+  if (warp == Pl::kMmaWarp) TmemDealloc(tbase, Pl::kAllocCols);
+  if (lp.maps.fwd_counter == nullptr && tid == 0) {
+    __threadfence();
+    if (atomicAdd(&g_fwd_done_ctas, 1u) == gridDim.x - 1u) {
+      atomicExch(&g_fwd_work_counter, 0u);
+      atomicExch(&g_fwd_done_ctas, 0u);
+    }
+  }
+}
+
 // ---------------------------------------------------------------- host
 // The compiled configuration: SmWarpsFor<kW>() softmax warps (below), 2 K stages, 2 S buffers.
 // Softmax warps per CTA, by one rule over the plan's budget rather than per shape: the 4-warp form
@@ -1638,38 +2245,21 @@ inline constexpr float kRescaleThreshold = 8.f;
 // dynamic SMEM base that the UMMA descriptors (base_offset 0) need. The host cannot see the address
 // a launch will get, so the kernel traps on it - a device fault that poisons the context, not a
 // refusal and not a fallback.
-template <class E, int kD, int kDv>
-int TryLaunchPipe(const UmmaLaunchParams& lp, cudaStream_t stream) {
-  PostAttemptErrorSlot() = cudaSuccess;
-  if (ForwardBodySlot() != ForwardBody::kPipe) return 0;
+template <class E, int kSm, int kKS, int kSB, int kD, int kDv, bool kForceOneCta,
+          bool kForceKeys64, bool kAllowRowSumMma, int kQDiv>
+int LaunchPipeKernelConfig(const UmmaLaunchParams& lp, int grid_mode, cudaStream_t stream) {
   const Params& hp = lp.params;
-  // The call's dims must be this launcher's buckets (ForwardCase dispatches on QkBucket and
-  // ValueBucket, so this holds for every caller); padded columns are the TMA's zero fill.
-  if (!PipeAccepts(hp) || QkBucket(hp.qk_dim) != kD || ValueBucket(hp.value_dim) != kDv) return 2;
-#if defined(XATTN_FWD_PROBE_HOOKS) && XATTN_FWD_PROBE_HOOKS
-  // Probe builds only: a pre-launch refusal, so that the caller's refusal row and generic fallback
-  // can be observed (a healthy sm_103 device grants every check below).
-  if (ProbeHook("pipe-refuse")) return 2;
-#endif
-  // The bucket pair is a compile-time constant of the plan: every constant (slab counts, tile
-  // bytes, SMEM, TMEM, threads, resident CTAs, softmax warps) follows from (kD, kDv).
-  constexpr int kSm = SmWarpsFor<kD, kDv>();
-  constexpr int kSBuffers = SBuffersFor<kD, kDv>();
-  constexpr int kKStages = KStagesFor<kD, kDv>();
-  using Pl = Plan<kSm, kKStages, kSBuffers, kD, kDv>;
+  using Pl = Plan<kSm, kKS, kSB, kD, kDv, kForceOneCta, kForceKeys64, kAllowRowSumMma, kQDiv>;
   const int smem_bytes = Pl::kSmemBytes;
   const int threads = Pl::kThreads;
   const auto kernel =
-      &PipeForwardKernel<E, kSm, kKStages, kSBuffers, kD, kDv>;
+      &PipeForwardKernel<E, kSm, kKS, kSB, kD, kDv, kForceOneCta, kForceKeys64, kAllowRowSumMma,
+                         kQDiv>;
   int device = 0;
   if (cudaGetDevice(&device) != cudaSuccess) {
     (void)cudaGetLastError();
     return 2;
   }
-  // The opt-in capacity is a constant of the device and the dynamic-SMEM attribute, once set, stays
-  // set on this instantiation for the device's context, so both are settled once per (device,
-  // instantiation): the bit is published only after the attribute call succeeded, and a device
-  // without its bit (or one numbered 64 or above) takes the checks below on every call.
   static std::atomic<uint64_t> attribute_ready{0};
   const uint64_t bit = device >= 0 && device < 64 ? (uint64_t(1) << device) : 0;
   if (bit == 0 || (attribute_ready.load(std::memory_order_acquire) & bit) == 0) {
@@ -1686,26 +2276,17 @@ int TryLaunchPipe(const UmmaLaunchParams& lp, cudaStream_t stream) {
     }
     attribute_ready.fetch_or(bit, std::memory_order_release);
   }
-  dim3 grid(static_cast<unsigned>((hp.q_length + kPipeRows - 1) / kPipeRows),
-            static_cast<unsigned>(hp.query_heads), static_cast<unsigned>(hp.batch));
+  const unsigned nqt = static_cast<unsigned>((hp.q_length + kPipeRows - 1) / kPipeRows);
+  const unsigned hq = static_cast<unsigned>(hp.query_heads);
+  const unsigned batch = static_cast<unsigned>(hp.batch);
+  dim3 grid = (grid_mode == 0)
+                  ? dim3(nqt, hq, batch)
+                  : ((grid_mode == 1) ? dim3(hq, nqt, batch) : dim3(nqt * hq, batch, 1u));
 #if defined(XATTN_FWD_PROBE_HOOKS) && XATTN_FWD_PROBE_HOOKS
-  // Fault control, probe builds only: an empty grid, which the runtime rejects AT the launch call
-  // (cudaErrorInvalidValue under CUDA 13.4) without enqueueing work or faulting the device, so the
-  // post-attempt path below runs on a healthy context.
   if (ProbeHook("pipe-posterr")) grid.x = 0u;
 #endif
-  // Drop any error latched before this point, so the status read after the launch call is that
-  // launch's own (LaunchUmmaForward drains at its entry too; the attribute calls consume theirs).
   (void)cudaGetLastError();
-#if XATTN_FWD_TRACE
-  if (std::getenv("XATTN_FWD_TRACE_OUT") != nullptr) {
-    void* tp = nullptr;
-    if (cudaGetSymbolAddress(&tp, g_fwd_trace) == cudaSuccess)
-      (void)cudaMemsetAsync(tp, 0, sizeof(unsigned long long) * kTraceCtas * kTraceSlots, stream);
-    (void)cudaGetLastError();
-  }
-#endif
-  kernel<<<grid, threads, smem_bytes, stream>>>(lp, kRescaleThreshold);
+  kernel<<<grid, threads, smem_bytes, stream>>>(lp, kRescaleThreshold, grid_mode);
   const cudaError_t launch_err = cudaGetLastError();
   if (launch_err != cudaSuccess) {
     PostAttemptErrorSlot() = launch_err;
@@ -1715,44 +2296,90 @@ int TryLaunchPipe(const UmmaLaunchParams& lp, cudaStream_t stream) {
     ThrowPostAttemptError(body);
   }
   PipeLaunchCount().fetch_add(1, std::memory_order_relaxed);
-#if XATTN_FWD_TRACE
-  {
-    // Probe builds only: append this launch's per-CTA stamps to $XATTN_FWD_TRACE_OUT.
-    const char* out = std::getenv("XATTN_FWD_TRACE_OUT");
-    if (out != nullptr) {
-      const size_t ctas = std::min<size_t>(static_cast<size_t>(grid.x) * grid.y * grid.z, kTraceCtas);
-      unsigned long long* hbuf = new unsigned long long[ctas * kTraceSlots];
-      if (cudaStreamSynchronize(stream) == cudaSuccess &&
-          cudaMemcpyFromSymbol(hbuf, g_fwd_trace, ctas * kTraceSlots * 8) == cudaSuccess) {
-        if (FILE* f = std::fopen(out, "ab")) {
-          const unsigned long long hdr[4] = {0x5452414345ull, grid.x, grid.y, grid.z};
-          std::fwrite(hdr, 8, 4, f);
-          std::fwrite(hbuf, 8, ctas * kTraceSlots, f);
-          std::fclose(f);
-        }
-      } else {
-        (void)cudaGetLastError();
-      }
-      delete[] hbuf;
-    }
-  }
-#endif
-#if defined(XATTN_FWD_PROBE_HOOKS) && XATTN_FWD_PROBE_HOOKS
-  {
-    // Probe builds only: the cumulative lazy-rescale and clear counts of this element type after
-    // the launch.
-    unsigned long long events = 0, clears = 0;
-    if (cudaStreamSynchronize(stream) == cudaSuccess &&
-        cudaMemcpyFromSymbol(&events, g_pipe_rescale_events, sizeof(events)) == cudaSuccess &&
-        cudaMemcpyFromSymbol(&clears, g_pipe_clear_events, sizeof(clears)) == cudaSuccess) {
-      std::fprintf(stderr, "XATTN_FWD_PIPE_RESCALE_EVENTS %llu CLEAR_EVENTS %llu\n", events, clears);
-    } else {
-      (void)cudaGetLastError();
-      std::fprintf(stderr, "XATTN_FWD_PIPE_RESCALE_EVENTS unreadable\n");
-    }
-  }
-#endif
   return 1;
+}
+
+template <class E, int kKS, int kD, int kDv>
+int LaunchPipePersistentConfig(const UmmaLaunchParams& lp, cudaStream_t stream) {
+  const Params& hp = lp.params;
+  using Pl = PersistPlan<kKS, kD, kDv>;
+  const int smem_bytes = Pl::kSmemBytes;
+  const int threads = Pl::kThreads;
+  const auto kernel = &PipeForwardPersistentKernel<E, kKS, kD, kDv>;
+  int device = 0;
+  if (cudaGetDevice(&device) != cudaSuccess) {
+    (void)cudaGetLastError();
+    return 2;
+  }
+  static std::atomic<uint64_t> attribute_ready{0};
+  static int cached_sms[64] = {0};
+  const uint64_t bit = device >= 0 && device < 64 ? (uint64_t(1) << device) : 0;
+  int num_sms = 0;
+  if (bit == 0 || (attribute_ready.load(std::memory_order_acquire) & bit) == 0) {
+    int cap = 0;
+    if (cudaDeviceGetAttribute(&cap, cudaDevAttrMaxSharedMemoryPerBlockOptin, device) != cudaSuccess ||
+        cudaDeviceGetAttribute(&num_sms, cudaDevAttrMultiProcessorCount, device) != cudaSuccess) {
+      (void)cudaGetLastError();
+      return 2;
+    }
+    if (smem_bytes > cap) return 2;
+    if (cudaFuncSetAttribute(reinterpret_cast<const void*>(kernel),
+                             cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes) != cudaSuccess) {
+      (void)cudaGetLastError();
+      return 2;
+    }
+    if (bit != 0) {
+      cached_sms[device] = num_sms;
+      attribute_ready.fetch_or(bit, std::memory_order_release);
+    }
+  } else {
+    num_sms = cached_sms[device];
+  }
+  const int64_t nqt = (hp.q_length + kPipeRows - 1) / kPipeRows;
+  const int64_t total64 = hp.batch * nqt * hp.query_heads;
+  if (total64 <= 0 || total64 > INT_MAX) return 2;
+  const int total_tiles = static_cast<int>(total64);
+  const int max_ctas = num_sms * Pl::kCtasPerSm;
+  const int grid_x = total_tiles < max_ctas ? total_tiles : max_ctas;
+  (void)cudaGetLastError();
+  kernel<<<static_cast<unsigned>(grid_x), threads, smem_bytes, stream>>>(
+      lp, kRescaleThreshold, total_tiles);
+  const cudaError_t launch_err = cudaGetLastError();
+  if (launch_err != cudaSuccess) {
+    PostAttemptErrorSlot() = launch_err;
+    char body[96];
+    std::snprintf(body, sizeof(body), "the persistent (%d,%d) body (PipeForwardPersistentKernel)",
+                  kD, kDv);
+    ThrowPostAttemptError(body);
+  }
+  PipeLaunchCount().fetch_add(1, std::memory_order_relaxed);
+  return 1;
+}
+
+template <class E, int kD, int kDv>
+int TryLaunchPipe(const UmmaLaunchParams& lp, cudaStream_t stream) {
+  PostAttemptErrorSlot() = cudaSuccess;
+  if (ForwardBodySlot() != ForwardBody::kPipe) return 0;
+  const Params& hp = lp.params;
+  if (!PipeAccepts(hp) || QkBucket(hp.qk_dim) != kD || ValueBucket(hp.value_dim) != kDv) return 2;
+#if defined(XATTN_FWD_PROBE_HOOKS) && XATTN_FWD_PROBE_HOOKS
+  if (ProbeHook("pipe-refuse")) return 2;
+#endif
+  const bool can_persist =
+      (kD == 128 && kDv == 128) && !hp.strict && hp.q_segment == nullptr &&
+      hp.scale_log2 > 0.f && (hp.row_lo == nullptr || lp.maps.tile128_bounds_ready);
+  if constexpr (kD == 128 && kDv == 128) {
+    if (can_persist) {
+      return LaunchPipePersistentConfig<E, 3, 128, 128>(lp, stream);
+    }
+    return LaunchPipeKernelConfig<E, 4, 3, 2, 128, 128, false, false, true, 2>(lp, 2, stream);
+  } else {
+    constexpr int kSm = SmWarpsFor<kD, kDv>();
+    constexpr int kSBuffers = SBuffersFor<kD, kDv>();
+    constexpr int kKStages = KStagesFor<kD, kDv>();
+    return LaunchPipeKernelConfig<E, kSm, kKStages, kSBuffers, kD, kDv, false, false, true, 2>(
+        lp, 2, stream);
+  }
 }
 
 }  // namespace fwdpipe

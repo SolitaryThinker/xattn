@@ -130,10 +130,14 @@
 #include <ATen/ATen.h>
 #include <ATen/cuda/CUDAContext.h>
 #include <ATen/cuda/EmptyTensor.h>
+#include <c10/cuda/CUDAException.h>
 #include <c10/cuda/CUDAGuard.h>
+#include <c10/cuda/CUDAStream.h>
 #include <c10/util/Exception.h>
 #include <torch/csrc/autograd/python_variable.h>
 
+#include <algorithm>
+#include <array>
 #include <atomic>
 #include <cmath>
 #include <cstdlib>
@@ -667,7 +671,9 @@ std::tuple<at::Tensor, at::Tensor> RowBoundsFromMask(const at::Tensor& mask, int
 void CheckRowBoundsMaskArgs(const at::Tensor& mask, int64_t q_length, int64_t total,
                             int64_t chunk_size);
 void LaunchRowBoundsMaskInto(const at::Tensor& mask_c, int64_t q_length, int64_t total,
-                             int64_t chunk_size, bool strict, int32_t* lo, int32_t* hi);
+                             int64_t chunk_size, bool strict, int32_t* lo, int32_t* hi,
+                             cudaStream_t stream, int32_t* tile_bounds_out = nullptr,
+                             bool tile128 = false);
 
 // A contiguous, uninitialized CUDA tensor from the CUDA caching allocator: what at::empty makes
 // for these options, without the operator dispatch at::empty goes through first.
@@ -696,9 +702,15 @@ std::tuple<at::Tensor, at::Tensor> Forward(
   // and PrepareCommon's (the row-bounds device check runs after PrepareCommon's, where its
   // check of row bound tensors ran).
   at::Tensor mask_meta;
+  at::Tensor mask_c;
   int32_t* meta_lo = nullptr;
   int32_t* meta_hi = nullptr;
   int32_t* meta_tiles = nullptr;
+  int32_t* fwd_ljf_ptr = nullptr;
+  unsigned int* fwd_cnt_ptr = nullptr;
+  int64_t mask_total = 0;
+  int64_t total_q128 = 0;
+  bool use_tile128_meta = false;
   if (bos_mask) {
     TORCH_CHECK(!row_lo.has_value() && !row_hi.has_value(),
                 "native FlashSCA takes row bounds or a BOS mask, not both");
@@ -707,19 +719,28 @@ std::tuple<at::Tensor, at::Tensor> Forward(
                 "native FlashSCA bos_mask must be [B, Nt] with Nt >= Nq; got ",
                 bos_mask->sizes(), " for q of ", q.sizes());
     const int64_t Nq = q.size(1), total = bos_mask->size(1);
+    mask_total = total;
     CheckRowBoundsMaskArgs(*bos_mask, Nq, total, chunk_size);
     const int64_t B = bos_mask->size(0);
     constexpr int64_t kAlignInts = 64;  // 256 bytes
     const int64_t row_span = (B * Nq + kAlignInts - 1) / kAlignInts * kAlignInts;
     const int64_t tile_ints = B * ((Nq + 63) / 64) * 4;
+    const int64_t nqt128 = (Nq + 127) / 128;
+    total_q128 = B * nqt128;
+    const int64_t ljf_need = total_q128 * 4 + total_q128 + 4;
+    const int64_t extra_ints = tile_ints > ljf_need ? tile_ints : ljf_need;
     c10::cuda::CUDAGuard mask_guard(bos_mask->device());
-    at::Tensor mask_c = bos_mask->contiguous();
-    mask_meta = EmptyCuda({2 * row_span + tile_ints}, at::kInt, bos_mask->device());
+    mask_c = bos_mask->contiguous();
+    mask_meta = EmptyCuda({2 * row_span + extra_ints}, at::kInt, bos_mask->device());
     int32_t* const base = mask_meta.data_ptr<int32_t>();
     meta_lo = base;
     meta_hi = base + row_span;
     meta_tiles = base + 2 * row_span;
-    LaunchRowBoundsMaskInto(mask_c, Nq, total, chunk_size, strict, meta_lo, meta_hi);
+    use_tile128_meta = (B > 0 && total_q128 > 0 && !strict);
+    if (use_tile128_meta && total_q128 <= 2048) {
+      fwd_ljf_ptr = meta_tiles + total_q128 * 4;
+      fwd_cnt_ptr = reinterpret_cast<unsigned int*>(fwd_ljf_ptr + total_q128);
+    }
   }
   Prepared prepared = PrepareCommon(q, k, v, prev_k, prev_v, chunk_size, scale, q_segment,
                                     k_segment, segment_exact, row_lo, row_hi, strict);
@@ -790,6 +811,35 @@ std::tuple<at::Tensor, at::Tensor> Forward(
   // scheduling instrument resolves the generic body, as above.
   const umma::fwdpipe::ForwardBody body =
       ResolveForwardBody(arms, umma::fwdpipe::PipeAccepts(p), order_instrument);
+  // When the caller passed precomputed row_lo/row_hi (e.g., xllm's cached visibility route
+  // without bos_mask) for a persistent-eligible (128,128) kPipe forward, allocate the tiny
+  // tile128_bounds + LJF worklist buffer and populate it in one launch right before LaunchForward
+  // so F2 Persistent LJF Forward activates on both bos_mask and precomputed row_bounds routes.
+  const bool row_bounds_persist_meta =
+      !mask_meta.defined() && body == umma::fwdpipe::ForwardBody::kPipe &&
+      p.row_lo != nullptr && p.q_segment == nullptr && !p.strict &&
+      QkBucket(p.qk_dim) == 128 && ValueBucket(p.value_dim) == 128;
+  if (mask_meta.defined()) {
+    p.tile_bounds = meta_tiles;
+  } else if (row_bounds_persist_meta) {
+    const int64_t nqt128 = (p.q_length + 127) / 128;
+    total_q128 = p.batch * nqt128;
+    const int64_t tile_ints = p.batch * p.tile_count * 4;
+    const int64_t ljf_need = total_q128 * 4 + total_q128 + 4;
+    const int64_t extra_ints = tile_ints > ljf_need ? tile_ints : ljf_need;
+    prepared.tile_bounds = EmptyCuda({extra_ints}, at::kInt, q.device());
+    meta_tiles = prepared.tile_bounds.data_ptr<int32_t>();
+    p.tile_bounds = meta_tiles;
+    use_tile128_meta = (p.batch > 0 && total_q128 > 0);
+    if (use_tile128_meta && total_q128 <= 2048) {
+      fwd_ljf_ptr = meta_tiles + total_q128 * 4;
+      fwd_cnt_ptr = reinterpret_cast<unsigned int*>(fwd_ljf_ptr + total_q128);
+    }
+  } else {
+    prepared.tile_bounds = EmptyCuda({p.batch, p.tile_count, 4}, at::kInt, q.device());
+    p.tile_bounds = prepared.tile_bounds.data_ptr<int32_t>();
+  }
+
   umma::fwd_host::PreparedUmmaCall umma_call;
   if (body != umma::fwdpipe::ForwardBody::kGeneric && !order_instrument &&
       HasUmmaForwardLeaf(p.qk_dim, p.value_dim)) {
@@ -803,9 +853,13 @@ std::tuple<at::Tensor, at::Tensor> Forward(
     // [B, Nq, Hq, Dv] and 256 B aligned, so it needs no canonicalization; the map's extent is the
     // logical one, so a box past Nq or past Dv is clipped by the TMA.
     if (body == umma::fwdpipe::ForwardBody::kPipe) {
+      const int dev = static_cast<int>(q.get_device());
       umma_call.launch.maps.y =
-          umma::EncodeInputMap(umma::bwd_host::MakeOperand(y), p.element, p.batch, p.q_length,
-                               p.query_heads, p.value_dim);
+          umma::CachedInputMap(umma::bwd_host::MakeOperand(y), p.element, p.batch, p.q_length,
+                               p.query_heads, p.value_dim, dev);
+      umma_call.launch.maps.tile128_bounds_ready = use_tile128_meta;
+      umma_call.launch.maps.fwd_ljf_order = fwd_ljf_ptr;
+      umma_call.launch.maps.fwd_counter = fwd_cnt_ptr;
     }
     p.umma_maps = &umma_call.launch.maps;
   }
@@ -816,21 +870,18 @@ std::tuple<at::Tensor, at::Tensor> Forward(
   };
   const int64_t umma_ran_before = umma_ran();
   const cudaStream_t stream = at::cuda::getCurrentCUDAStream(q.get_device());
-  // The tile-bounds table is the generic and older-leaf bodies' key-tile walk; the pipelined
-  // body walks key tiles from min_lo / max_hi derived per row in-kernel and reads no table
-  // (umma_fwd_pipe.cuh). Build and launch the table for a body that reads it, so a pipelined
-  // forward pays neither the [B, ceil(Nq/64), 4] allocation nor the metadata launch. `body`
-  // is the one value both this preparation and the launch site below read, and a live
-  // scheduling instrument resolved kGeneric above, so an instrumented call keeps the table.
-  // The table is allocated for every body (an allocation, no launch), so a pipelined call that
-  // the pipe refuses before its launch can fall back to the generic body with a table to read:
-  // LaunchUmmaForward fills it on that refusal (umma_fwd.cuh). The mask route's table is the
-  // third segment of its one metadata allocation (above).
-  if (mask_meta.defined()) {
-    p.tile_bounds = meta_tiles;
-  } else {
-    prepared.tile_bounds = at::empty({p.batch, p.tile_count, 4}, q.options().dtype(at::kInt));
-    p.tile_bounds = prepared.tile_bounds.data_ptr<int32_t>();
+  // Launch fast 1-wave RowBoundsKernel<2> (+ tile128_bounds) & BuildFwdLjf right before
+  // LaunchForward (after host TMA descriptor lookup) so there is zero host bubble.
+  if (bos_mask) {
+    const bool emit_tile128 = (body == umma::fwdpipe::ForwardBody::kPipe && use_tile128_meta);
+    LaunchRowBoundsMaskInto(mask_c, p.q_length, mask_total, chunk_size, strict, meta_lo, meta_hi,
+                            stream, emit_tile128 ? meta_tiles : nullptr, /*tile128=*/emit_tile128);
+    if (body == umma::fwdpipe::ForwardBody::kPipe && fwd_ljf_ptr != nullptr) {
+      LaunchBuildFwdLjf(meta_tiles, fwd_ljf_ptr, fwd_cnt_ptr, p.batch, p.q_length,
+                        p.total_length, stream);
+    }
+  } else if (row_bounds_persist_meta && use_tile128_meta) {
+    LaunchTile128BoundsAndFwdLjf(p, meta_tiles, fwd_ljf_ptr, fwd_cnt_ptr, stream);
   }
   if (body != umma::fwdpipe::ForwardBody::kPipe) LaunchTileBounds(p, stream);
   {
@@ -1068,6 +1119,44 @@ void ForwardFastLearn(XATTN_FAST_ARGS) {
 #undef XATTN_FAST_ARGS
 #undef XATTN_FAST_PASS
 
+struct CachedBwdSync {
+  int dev = -1;
+  cudaEvent_t start = nullptr;
+  cudaEvent_t meta_done = nullptr;
+  cudaStream_t meta_stream = nullptr;
+  cudaStream_t dq_stream = nullptr;
+  ~CachedBwdSync() {
+    if (start) (void)cudaEventDestroy(start);
+    if (meta_done) (void)cudaEventDestroy(meta_done);
+    if (meta_stream) (void)cudaStreamDestroy(meta_stream);
+    if (dq_stream) (void)cudaStreamDestroy(dq_stream);
+  }
+  void Ensure(int device) {
+    if (dev == device && start != nullptr && meta_done != nullptr &&
+        meta_stream != nullptr && dq_stream != nullptr) {
+      return;
+    }
+    if (start) (void)cudaEventDestroy(start);
+    if (meta_done) (void)cudaEventDestroy(meta_done);
+    if (meta_stream) (void)cudaStreamDestroy(meta_stream);
+    if (dq_stream) (void)cudaStreamDestroy(dq_stream);
+    start = meta_done = nullptr;
+    meta_stream = dq_stream = nullptr;
+    C10_CUDA_CHECK(cudaEventCreateWithFlags(&start, cudaEventDisableTiming));
+    C10_CUDA_CHECK(cudaEventCreateWithFlags(&meta_done, cudaEventDisableTiming));
+    int least_prio = 0, greatest_prio = 0;
+    C10_CUDA_CHECK(cudaDeviceGetStreamPriorityRange(&least_prio, &greatest_prio));
+    C10_CUDA_CHECK(cudaStreamCreateWithPriority(&meta_stream, cudaStreamNonBlocking, greatest_prio));
+    C10_CUDA_CHECK(cudaStreamCreateWithFlags(&dq_stream, cudaStreamNonBlocking));
+    dev = device;
+  }
+};
+
+CachedBwdSync& BwdSyncRef() {
+  static thread_local CachedBwdSync sync;
+  return sync;
+}
+
 std::tuple<at::Tensor, at::Tensor, at::Tensor, OptionalTensor, OptionalTensor> Backward(
     const at::Tensor& dy, const at::Tensor& q, const at::Tensor& k, const at::Tensor& v,
     const OptionalTensor& prev_k, const OptionalTensor& prev_v, const at::Tensor& saved,
@@ -1094,11 +1183,10 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, OptionalTensor, OptionalTensor> B
               "XATTN_SCA_BWD_DQ_PIPE must be unset, empty, '0' or '1'; got '",
               std::string(dq_pipe_value != nullptr ? dq_pipe_value : ""), "'");
   c10::cuda::CUDAGuard guard(q.device());
-  // A BOS mask given here is the whole metadata boundary (see Forward): one metadata launch in
-  // this call, and the caller passes no row bounds.
-  at::Tensor mask_lo, mask_hi;
-  OptionalTensor lo_arg = row_lo;
-  OptionalTensor hi_arg = row_hi;
+  const int dev = static_cast<int>(q.get_device());
+  // A BOS mask given here is the whole metadata boundary: fused RowBounds(+TileBounds) +
+  // BuildKeyRangeAndLjf run on a high-priority metadata stream in parallel with Delta.
+  at::Tensor mask_c;
   if (bos_mask) {
     TORCH_CHECK(!row_lo.has_value() && !row_hi.has_value(),
                 "native FlashSCA takes row bounds or a BOS mask, not both");
@@ -1106,25 +1194,27 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, OptionalTensor, OptionalTensor> B
                     bos_mask->size(1) >= q.size(1),
                 "native FlashSCA bos_mask must be [B, Nt] with Nt >= Nq; got ",
                 bos_mask->sizes(), " for q of ", q.sizes());
-    std::tie(mask_lo, mask_hi) =
-        RowBoundsFromMask(*bos_mask, q.size(1), bos_mask->size(1), chunk_size, strict);
-    lo_arg = mask_lo;
-    hi_arg = mask_hi;
+    CheckRowBoundsMaskArgs(*bos_mask, q.size(1), bos_mask->size(1), chunk_size);
+    c10::cuda::CUDAGuard mask_guard(bos_mask->device());
+    mask_c = bos_mask->contiguous();
   }
   Prepared prepared = PrepareCommon(q, k, v, prev_k, prev_v, chunk_size, scale, q_segment,
-                                    k_segment, segment_exact, lo_arg, hi_arg, strict);
+                                    k_segment, segment_exact, row_lo, row_hi, strict);
   Params& p = prepared.params;
+  if (bos_mask) {
+    CheckDevice(mask_c, q, "row bounds");
+  }
   CheckDevice(dy, q, "y_grad");
   CheckDevice(saved, q, "saved output");
   CheckDevice(lse, q, "lse");
-  const std::vector<int64_t> out_shape{p.batch, p.q_length, p.query_heads, p.value_dim};
-  TORCH_CHECK(dy.sizes() == out_shape && dy.scalar_type() == q.scalar_type(),
+  const std::array<int64_t, 4> out_shape{p.batch, p.q_length, p.query_heads, p.value_dim};
+  const std::array<int64_t, 3> lse_shape{p.batch, p.query_heads, p.q_length};
+  TORCH_CHECK(dy.sizes() == at::IntArrayRef(out_shape) && dy.scalar_type() == q.scalar_type(),
               "native FlashSCA y_grad must be [B,Nq,Hq,Dv] in Q's dtype");
-  TORCH_CHECK(saved.sizes() == out_shape &&
+  TORCH_CHECK(saved.sizes() == at::IntArrayRef(out_shape) &&
                   (saved.scalar_type() == q.scalar_type() || saved.scalar_type() == at::kFloat),
               "native FlashSCA saved output must be [B,Nq,Hq,Dv] in Q's dtype or FP32");
-  TORCH_CHECK(lse.scalar_type() == at::kFloat &&
-                  lse.sizes() == std::vector<int64_t>({p.batch, p.query_heads, p.q_length}),
+  TORCH_CHECK(lse.scalar_type() == at::kFloat && lse.sizes() == at::IntArrayRef(lse_shape),
               "native FlashSCA lse must be FP32 [B,Hq,Nq]");
   at::Tensor dy_c = PrepareContiguous(dy);
   at::Tensor saved_c = PrepareContiguous(saved);
@@ -1133,8 +1223,6 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, OptionalTensor, OptionalTensor> B
   p.saved = saved_c.data_ptr();
   p.saved_fp32 = saved.scalar_type() == at::kFloat;
   p.lse_in = lse_c.data_ptr<float>();
-  auto delta = at::empty({p.batch, p.query_heads, p.q_length}, q.options().dtype(at::kFloat));
-  p.delta = delta.data_ptr<float>();
 
   // FP32 key gradients (upstream's fp32_kv_grads, the composed SoftDelta merge input): the
   // values every key writer would round to the input dtype, so they exist only where a key
@@ -1142,14 +1230,14 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, OptionalTensor, OptionalTensor> B
   TORCH_CHECK(!fp32_kv_grads || p.group > 1,
               "FlashSCA FP32 dK / dV gradients need grouped query heads");
   p.key_grads_fp32 = fp32_kv_grads;
-  const auto key_options = fp32_kv_grads ? q.options().dtype(at::kFloat) : q.options();
-  auto dq = at::empty({p.batch, p.q_length, p.query_heads, p.qk_dim}, q.options());
-  auto dk = at::empty({p.batch, p.k_length, p.kv_heads, p.qk_dim}, key_options);
-  auto dv = at::empty({p.batch, p.k_length, p.kv_heads, p.value_dim}, key_options);
+  const auto key_dtype = fp32_kv_grads ? at::kFloat : q.scalar_type();
+  auto dq = EmptyCuda({p.batch, p.q_length, p.query_heads, p.qk_dim}, q.scalar_type(), q.device());
+  auto dk = EmptyCuda({p.batch, p.k_length, p.kv_heads, p.qk_dim}, key_dtype, q.device());
+  auto dv = EmptyCuda({p.batch, p.k_length, p.kv_heads, p.value_dim}, key_dtype, q.device());
   OptionalTensor dprev_k, dprev_v;
   if (prev_k) {
-    dprev_k = at::empty({p.batch, p.prev_length, p.kv_heads, p.qk_dim}, key_options);
-    dprev_v = at::empty({p.batch, p.prev_length, p.kv_heads, p.value_dim}, key_options);
+    dprev_k = EmptyCuda({p.batch, p.prev_length, p.kv_heads, p.qk_dim}, key_dtype, q.device());
+    dprev_v = EmptyCuda({p.batch, p.prev_length, p.kv_heads, p.value_dim}, key_dtype, q.device());
     p.dprev_k = dprev_k->data_ptr();
     p.dprev_v = dprev_v->data_ptr();
   }
@@ -1157,57 +1245,62 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, OptionalTensor, OptionalTensor> B
   p.dk = dk.data_ptr();
   p.dv = dv.data_ptr();
   if (p.batch == 0) return {dq, dk, dv, dprev_k, dprev_v};
-  // The backward's key leaves walk 64-row key tiles through Params::tile_bounds, so this route
-  // builds the table for every schedule it may take (generic or native) - PrepareCommon no
-  // longer allocates it, because the pipelined forward reads none.
-  prepared.tile_bounds = at::empty({p.batch, p.tile_count, 4}, q.options().dtype(at::kInt));
-  p.tile_bounds = prepared.tile_bounds.data_ptr<int32_t>();
-  // The arm decides whether dQ is reduced inside the dK/dV kernels (the branch's own
-  // allocation and fold both read `!deterministic && !split`). Hoisted above the plan
-  // call so `deterministic || split` is its exact complement, and read ONCE: the opt-in
-  // is env-backed, so a second read in one call is a divergence waiting to happen.
+
+  auto delta = EmptyCuda({p.batch, p.query_heads, p.q_length}, at::kFloat, q.device());
+  p.delta = delta.data_ptr<float>();
+
+  // The arm decides whether dQ is reduced inside the dK/dV kernels. Hoisted above metadata
+  // allocation so any invalid/retired env raises before device allocations.
   const BackwardRequest request = BackwardArmOptIn();
-  // The raw arm value was already stored inside the parser, above its refusals -
-  // the only place a refused call can still be read back from, since a refusal
-  // raises before this line. A second store here would be a second writer for one
-  // value, and it would never run for the calls that matter.
   const BackwardArm arm = request.arm;
-  const bool split = arm == BackwardArm::kSplit;
   const bool force_generic = request.force_generic;
   const bool require_native = request.require_native;
-  const cudaStream_t stream = at::cuda::getCurrentCUDAStream(q.get_device());
-  at::Tensor key_tile_range;
-  if (p.row_lo != nullptr) {
-    p.key_tile_count = (p.total_length + 63) / 64;
-    key_tile_range = at::empty({p.batch, p.key_tile_count, 2}, q.options().dtype(at::kInt));
-    p.key_tile_range = key_tile_range.data_ptr<int32_t>();
+  const cudaStream_t stream = at::cuda::getCurrentCUDAStream(dev);
+
+  // Single combined int32 metadata allocation: [row_lo | row_hi | tile_bounds | key_tile_range | worklist].
+  constexpr int64_t kAlignInts = 64;
+  auto align_up = [](int64_t n) -> int64_t {
+    return (n + kAlignInts - 1) / kAlignInts * kAlignInts;
+  };
+  const bool has_mask = bos_mask.has_value();
+  const bool has_bounds = has_mask || (p.row_lo != nullptr);
+  const int64_t row_span = has_mask ? align_up(p.batch * p.q_length) : 0;
+  const int64_t tb_span = align_up(p.batch * p.tile_count * 4);
+  const int64_t kt_count = has_bounds ? (p.total_length + 63) / 64 : 0;
+  const int64_t kt_span = has_bounds ? align_up(p.batch * kt_count * 2) : 0;
+  const int64_t nkt = (p.total_length + 127) / 128;
+  const int64_t kv_pairs = p.batch * nkt;
+  const int64_t total_kv_tiles = kv_pairs * p.kv_heads;
+  const int64_t q_pairs = p.batch * ((p.q_length + 127) / 128);
+  const bool use_kv_sched = (!p.key_grads_fp32 && kv_pairs > 0 && kv_pairs <= 2048 &&
+                             p.batch <= 64 && p.kv_heads <= 256 && nkt <= 65535 &&
+                             total_kv_tiles <= 65536);
+  const bool use_q_ljf = (q_pairs > 0 && q_pairs <= 2048);
+  const int64_t kv_wl_ints = use_kv_sched ? total_kv_tiles : 0;
+  const int64_t q_wl_ints = use_q_ljf ? q_pairs : 0;
+  const int64_t wl_ints = kv_wl_ints + q_wl_ints + 2;
+  const int64_t total_meta_ints = 2 * row_span + tb_span + kt_span + align_up(wl_ints);
+  at::Tensor bwd_meta = EmptyCuda({total_meta_ints}, at::kInt, q.device());
+  int32_t* cursor = bwd_meta.data_ptr<int32_t>();
+  int32_t* mask_lo_ptr = nullptr;
+  int32_t* mask_hi_ptr = nullptr;
+  if (has_mask) {
+    mask_lo_ptr = cursor;
+    cursor += row_span;
+    mask_hi_ptr = cursor;
+    cursor += row_span;
+    p.row_lo = mask_lo_ptr;
+    p.row_hi = mask_hi_ptr;
   }
+  p.tile_bounds = cursor;
+  cursor += tb_span;
+  if (has_bounds) {
+    p.key_tile_count = kt_count;
+    p.key_tile_range = cursor;
+    cursor += kt_span;
+  }
+  int32_t* wl_base = cursor;
 
-  // Decide before allocating. The family plan, not the user's determinism flag,
-  // owns dQ: `deterministic=false` permits a direct row-owned writer, so an
-  // accumulator allocated from the flag alone would be a 1.07 GB allocation of
-  // which a native writer knows nothing.
-  //
-  // The driver is reached only on a preparation that succeeded. The preparation
-  // takes `Params` by const reference and fills its own copy (`out.launch.params`),
-  // so the refusal branch below keeps the caller's normalized operands. The
-  // generic atomic route retains its usual reduction-order nondeterminism.
-
-  // Refusal is a STATUS, not an exception (umma_prepare.h) and not a silent skip.
-  // When no native leaf serves the call, the seed's mma.sync body runs exactly as it
-  // does without a native leaf, including the seed's own dQ protocol. The preparation
-  // takes `p` by const reference and fills its own copy, so `p` here is the Params
-  // the generic branch uses.
-  // Preparation may decline before commitment. Once preparation succeeds the
-  // planner always has a complete generic schedule for valid calls; a plan
-  // failure is therefore an invariant error, not permission to hide the defect
-  // behind a fallback. A selected leaf that fails its final check also raises.
-  // The single per-call arm parser runs before preparation. 'generic' avoids
-  // TMA encoding/packing entirely; its preprocessing cost is therefore not
-  // the cost of preparing a native call and then falling back. 'native' is a
-  // strict A/B instrument: it requires BOTH native product writers, not just
-  // an accepted mixed or all-generic plan. Default dispatch may use those
-  // complete mixed plans; the require arm raises instead of timing a fallback.
   bwd_host::BackwardUmma umma;
   if (!force_generic) {
     umma = bwd_host::PrepareBackwardUmma(
@@ -1239,7 +1332,6 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, OptionalTensor, OptionalTensor> B
   g_last_backward.qk_bucket = QkBucket(p.qk_dim);
   g_last_backward.value_bucket = ValueBucket(p.value_dim);
   {
-    // Ask the same table the launch asks; a bucket with no row reports the default.
     const auto* key_row = umma::FindBackwardLeaf(umma::BackwardProduct::kDkdv, p);
     g_last_backward.key_rows = key_row ? key_row->key_rows : umma::kInSituKeyRowsDefault;
   }
@@ -1251,17 +1343,15 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, OptionalTensor, OptionalTensor> B
               bwd_host::RefusalName(umma.refusal), ", dq=", EligibilityName(phases.dq_eligibility),
               ", key=", EligibilityName(phases.key_eligibility));
   if (!use_phase_driver) {
-    // No atomic dQ accumulator on B300 (deterministic-only): p.dq_accum stays null, so the
-    // generic body writes dQ row-owned in a fixed order.
     at::Tensor dq_accum;
-    // The native delta stage now builds delta, the query tile bounds and the key
-    // tile range in one launch (launch.cuh:BackwardDeltaStage); nothing here.
+    if (has_mask) {
+      LaunchRowBoundsMaskInto(mask_c, p.q_length, mask_c.size(1), chunk_size, strict,
+                              mask_lo_ptr, mask_hi_ptr, stream);
+    }
     LaunchBackward(p, stream);
     if (dq_accum.defined()) {
       dq.copy_(dq_accum.mul_(p.scale));
     }
-    // After every launch of this branch: `p` is the params LaunchBackward was handed, so the
-    // bounds/table booleans are what the generic body launched with.
     RecordRowBounds(p);
     g_last_backward.has_accumulator = dq_accum.defined();
     g_last_backward.launched = true;
@@ -1274,49 +1364,44 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, OptionalTensor, OptionalTensor> B
     dq_accum = at::zeros(dq.sizes(), q.options().dtype(at::kFloat));
     p.dq_accum = dq_accum.data_ptr<float>();
   }
-  // Final pointer/coverage and exact leaf predicates run after scratch binding,
-  // before metadata/product launches. All selected key writers cover their
-  // complete output plane; zero_prev is structurally false in this mount.
+  int32_t* kv_ljf_ptr = use_kv_sched ? wl_base : nullptr;
+  int32_t* q_ljf_ptr = use_q_ljf ? (wl_base + kv_wl_ints) : nullptr;
+  unsigned int* kv_cnt_ptr = reinterpret_cast<unsigned int*>(wl_base + kv_wl_ints + q_wl_ints);
+  unsigned int* dq_cnt_ptr = kv_cnt_ptr + 1;
+  umma.launch.kv_ljf_order = kv_ljf_ptr;
+  umma.launch.q_ljf_order = q_ljf_ptr;
+  umma.launch.kv_counter = kv_cnt_ptr;
+  umma.launch.dq_counter = dq_cnt_ptr;
+
   TORCH_CHECK(CheckBackwardPhases(p, umma.launch, phases, &reason),
               "native FlashSCA backward: phases do not cover this call: ",
               reason ? reason : "?");
-  // Reserved omitted-region initialization: the validated schedule currently
-  // requires zero_prev == false and whole-plane key writers. Key ownership
-  // alone never implies that previous gradients need initialization.
   if (phases.zero_prev && dprev_k && dprev_k->defined()) {
     dprev_k->zero_();
     dprev_v->zero_();
   }
-  // delta + query tile bounds + key tile range are one launch inside
-  // LaunchBackwardPhases's delta stage (launch.cuh:BackwardDeltaStage).
-  LaunchBackwardPhases(p, umma.launch, phases, stream);
-  // Which key tile ACTUALLY launched, per call, after the launch. `key_rows` was set above
-  // from the row's static value, which is the arm the BUCKET prefers; at (128,128) the M128
-  // arm refuses an unpacked previous plane whose length is not a multiple of 128 and the same
-  // call then runs the M64 body in the same TU (umma_bwd_dkdv.cuh, InSituLaunchedKeyRows), so
-  // the static value would name an arm that did not run. Only a native key product may
-  // overwrite it: on the generic branch below the field keeps the prepared value and the
-  // phase tag already says `mma_sync`.
-  // `dkdv` ALONE is the right guard here, and it is right by a fact that lives in three other
-  // files, so it is written down rather than relied on: the key product has no atomic-dQ family
-  // on this tree. `QueryNativeSupport` (umma_bwd.cu) fills only `dq`, `dkdv` and
-  // `dkdv_writes_whole_plane`, and the registry (`sca_umma_bwd_registry.cu`, kEntries) emits rows
-  // for kDq and kDkdv only, so `FindBackwardLeaf(kAtomicDq, ...)` returns nullptr and
-  // `CheckBackwardPhases` fails the plan with "selected native leaf is not compiled" instead of
-  // labelling a generic body native. The day a kAtomicDq row is registered, both of those facts
-  // change at once and THIS GUARD MUST BE WIDENED to
-  // `dkdv || dkdv_atomic_dq` - widening it today would be a no-op that hides the dependency.
+
+  // Run fused RowBounds(+TileBounds) + BuildKeyRangeAndLjf on a cached HIGH-PRIORITY metadata
+  // stream so tiny metadata CTAs are scheduled immediately alongside DeltaVectorKernel, and
+  // reuse a dedicated cached dq_stream so DqPipeTileCounter hits its cache with zero churn.
+  CachedBwdSync& bsync = BwdSyncRef();
+  bsync.Ensure(dev);
+  C10_CUDA_CHECK(cudaEventRecord(bsync.start, stream));
+  C10_CUDA_CHECK(cudaStreamWaitEvent(bsync.meta_stream, bsync.start, 0));
+  if (has_mask) {
+    LaunchRowBoundsMaskInto(mask_c, p.q_length, mask_c.size(1), chunk_size, strict,
+                            mask_lo_ptr, mask_hi_ptr, bsync.meta_stream, p.tile_bounds);
+  }
+  LaunchKeyRangeAndLjf(p, /*tile_bounds_ready=*/has_mask, kv_ljf_ptr, q_ljf_ptr,
+                       kv_cnt_ptr, dq_cnt_ptr, bsync.meta_stream);
+  C10_CUDA_CHECK(cudaEventRecord(bsync.meta_done, bsync.meta_stream));
+
+  LaunchBackwardPhases(p, umma.launch, phases, stream, /*tables_ready_on_fork=*/true,
+                       bsync.dq_stream, bsync.meta_done, /*skip_recheck=*/true);
   if (phases.native.dkdv) g_last_backward.key_rows = umma::InSituLaunchedKeyRows();
-  // Fold only an actual atomic plan; never overwrite a direct producer. Keep
-  // the generic accumulator's scale-then-copy form, including the output cast.
   if (phases.needs_dq_accumulator()) {
     dq.copy_(dq_accum.mul_(p.scale));
   }
-  // After every launch of this branch. LaunchBackwardPhases rebinds its own copy with
-  // `call.params = params` before launching any leaf, and CheckBackwardPhases has just
-  // proved SameBackwardCall(params, native.params) - which compares row_lo, row_hi,
-  // key_tile_range and key_tile_count (umma_bwd.cu:SameBackwardCall) - so `p` here IS the
-  // params the leaves were launched with, not a second description of them.
   RecordRowBounds(p);
   g_last_backward.has_accumulator = dq_accum.defined();
   g_last_backward.launched = true;
@@ -1517,34 +1602,20 @@ void CheckRowBoundsMaskArgs(const at::Tensor& mask, int64_t q_length, int64_t to
 }
 
 void LaunchRowBoundsMaskInto(const at::Tensor& mask_c, int64_t q_length, int64_t total,
-                             int64_t chunk_size, bool strict, int32_t* lo, int32_t* hi) {
-  // The row-bounds launch over a contiguous mask into int32 [B, q_length] lo / hi at the given
-  // device addresses (on the mask's device; the caller holds the current device and the
-  // storage), after CheckRowBoundsMaskArgs. B == 0 launches nothing.
+                             int64_t chunk_size, bool strict, int32_t* lo, int32_t* hi,
+                             cudaStream_t stream, int32_t* tile_bounds_out, bool tile128) {
   const int64_t B = mask_c.size(0);
   if (B == 0) return;
-  RowBoundsMaskArgs args;
-  args.mask = reinterpret_cast<const uint8_t*>(mask_c.data_ptr<bool>());
-  args.row_lo = lo;
-  args.row_hi = hi;
-  args.batch = B;
-  args.q_length = q_length;
-  args.total = total;
-  args.chunk = chunk_size;
-  args.strict = strict ? 1 : 0;
-  LaunchRowBoundsMask(args, at::cuda::getCurrentCUDAStream(mask_c.get_device()));
+  const int32_t clamped_chunk =
+      static_cast<int32_t>(std::min<int64_t>(chunk_size, total + 1));
+  LaunchRowBoundsFromBos(reinterpret_cast<const unsigned char*>(mask_c.data_ptr<bool>()),
+                         lo, hi, B, total, q_length, total - q_length, clamped_chunk, strict,
+                         /*reset=*/false, stream, tile_bounds_out, tile128);
 }
 
 std::tuple<at::Tensor, at::Tensor> RowBoundsFromMask(const at::Tensor& mask, int64_t q_length,
                                                      int64_t total, int64_t chunk_size,
                                                      bool strict) {
-  // The metadata boundary one step earlier (row_bounds.h): a BOS mask in, the int32 [B, Nq] row
-  // bounds out, with no cumsum, no bool->int64 cast and no ids plane built at all - the caller
-  // makes no metadata call and this extension launches one metadata kernel. A start of the mask
-  // is a segment start, so the ids route's lower_bound/upper_bound over the cumsum are the mask's
-  // last start at or before the query position and its next start after it; integers only, no
-  // float and no order-dependent reduction, so this route, the ids route and the Python chain
-  // agree bit for bit. Above kMaskMaxKeys keys the caller builds the ids and uses RowBounds.
   CheckRowBoundsMaskArgs(mask, q_length, total, chunk_size);
   const int64_t B = mask.size(0);
   c10::cuda::CUDAGuard guard(mask.device());
@@ -1552,7 +1623,8 @@ std::tuple<at::Tensor, at::Tensor> RowBoundsFromMask(const at::Tensor& mask, int
   auto lo = at::empty({B, q_length}, mask.options().dtype(at::kInt));
   auto hi = at::empty({B, q_length}, mask.options().dtype(at::kInt));
   LaunchRowBoundsMaskInto(mask_c, q_length, total, chunk_size, strict,
-                          lo.data_ptr<int32_t>(), hi.data_ptr<int32_t>());
+                          lo.data_ptr<int32_t>(), hi.data_ptr<int32_t>(),
+                          at::cuda::getCurrentCUDAStream(mask_c.get_device()));
   return {lo, hi};
 }
 

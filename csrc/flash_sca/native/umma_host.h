@@ -72,16 +72,14 @@ inline CUtensorMap EncodeInputMap(const Operand& source, Element element,
   const auto type = element == Element::kHalf ? CU_TENSOR_MAP_DATA_TYPE_FLOAT16
                                              : CU_TENSOR_MAP_DATA_TYPE_BFLOAT16;
   // The encoder is a driver-API call and needs a context current on this host
-  // thread. The runtime binds the primary context lazily, at a thread's first
-  // runtime call that needs it, and PyTorch's device guard skips cudaSetDevice
-  // when the thread's device already matches. So on a thread whose first CUDA
-  // work is this call (the autograd engine's device thread running a native
-  // backward straight off flash_sca, or a recompute there) no context is
-  // current and the encode fails with CUDA_ERROR_INVALID_CONTEXT (201).
-  // cudaSetDevice makes the device's primary context current at once.
+  // thread. Bind the device's primary context once per (thread, device).
   int device = 0;
   C10_CUDA_CHECK(cudaGetDevice(&device));
-  C10_CUDA_CHECK(cudaSetDevice(device));
+  static thread_local int bound_device = -1;
+  if (bound_device != device) {
+    C10_CUDA_CHECK(cudaSetDevice(device));
+    bound_device = device;
+  }
   const CUresult result = TensorMapEncoder()(
       &map, type, 4, const_cast<void*>(source.ptr), extent.data(),
       byte_stride.data(), box.data(), step.data(), CU_TENSOR_MAP_INTERLEAVE_NONE,
@@ -91,6 +89,61 @@ inline CUtensorMap EncodeInputMap(const Operand& source, Element element,
               static_cast<int>(result), "; shape=[", batch, ",", rows, ",", heads, ",",
               columns, "]");
   return map;
+}
+
+// Per-thread cache of encoded 128-byte TMA descriptors keyed by every field EncodeInputMap reads.
+// Shared across forward (q, k, v, prev_k, prev_v, y) and backward (q, dy, k, v, prev_k, prev_v).
+struct InputMapKey {
+  int device = -1;
+  const void* ptr = nullptr;
+  int64_t batch_stride = 0, row_stride = 0, head_stride = 0;
+  int element = 0;
+  int64_t batch = 0, rows = 0, heads = 0, columns = 0;
+  bool operator==(const InputMapKey& o) const {
+    return device == o.device && ptr == o.ptr && batch_stride == o.batch_stride &&
+           row_stride == o.row_stride && head_stride == o.head_stride && element == o.element &&
+           batch == o.batch && rows == o.rows && heads == o.heads && columns == o.columns;
+  }
+};
+
+inline CUtensorMap CachedInputMap(const Operand& source, Element element, int64_t batch,
+                                  int64_t rows, int64_t heads, int64_t columns, int device) {
+  constexpr int kEntries = 32;
+  struct Entry {
+    InputMapKey key;
+    CUtensorMap map;
+    bool valid = false;
+  };
+  thread_local Entry entries[kEntries];
+  thread_local int next = 0;
+  InputMapKey key;
+  key.device = device;
+  key.ptr = source.ptr;
+  key.batch_stride = source.batch_stride;
+  key.row_stride = source.row_stride;
+  key.head_stride = source.head_stride;
+  key.element = static_cast<int>(element);
+  key.batch = batch;
+  key.rows = rows;
+  key.heads = heads;
+  key.columns = columns;
+  for (const Entry& e : entries) {
+    if (e.valid && e.key == key) return e.map;
+  }
+  const CUtensorMap map = EncodeInputMap(source, element, batch, rows, heads, columns);
+  Entry& slot = entries[next];
+  next = (next + 1) & (kEntries - 1);
+  slot.key = key;
+  slot.map = map;
+  slot.valid = true;
+  return map;
+}
+
+inline CUtensorMap CachedInputMap(const Operand& source, Element element, int64_t batch,
+                                  int64_t rows, int64_t heads, int64_t columns) {
+  int device = 0;
+  C10_CUDA_CHECK(cudaGetDevice(&device));
+  return CachedInputMap(source, element, batch, rows, heads, columns, device);
 }
 
 }  // namespace xattn::ops::flash_sca_native::umma

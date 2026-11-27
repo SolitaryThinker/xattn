@@ -8,6 +8,7 @@
 #include "flash_sca/native/backward_stage_mask.h"
 #include "flash_sca/native/dispatch_tag.cuh"
 #include "flash_sca/native/kernels.cuh"
+#include "flash_sca/native/row_bounds.h"
 #include "flash_sca/native/umma_params.h"
 
 namespace xattn::ops::flash_sca_native {
@@ -88,37 +89,87 @@ void ForwardCase(const Params& p, cudaStream_t stream) {
 // and no atomics. A second key-range launch runs only when the tile table is too
 // large for shared memory.
 template <typename E, int kLanes>
-inline void LaunchPreprocess(const Params& p, cudaStream_t stream) {
-  constexpr int kRowsPerBlock = detail::kPreprocessThreads / kLanes;
-  const unsigned row_tiles =
-      static_cast<unsigned>((p.q_length + kRowsPerBlock - 1) / kRowsPerBlock);
-  const dim3 grid(row_tiles, static_cast<unsigned>(p.query_heads),
-                  static_cast<unsigned>(p.batch));
-  if (p.key_tile_range != nullptr && p.tile_count <= detail::kPreprocessMaxTileCount) {
-    const int smem = static_cast<int>(p.tile_count * 4 * sizeof(int));
-    detail::PreprocessBackwardKernel<E, kLanes, true>
-        <<<grid, detail::kPreprocessThreads, smem, stream>>>(p);
-  } else {
-    detail::PreprocessBackwardKernel<E, kLanes, false>
-        <<<grid, detail::kPreprocessThreads, 0, stream>>>(p);
-    if (p.key_tile_range != nullptr) {
-      Params mutable_p = p;
-      LaunchKeyTileRange(mutable_p, stream);  // tile bounds were written above
+inline void LaunchDeltaVector(const Params& p, cudaStream_t stream) {
+  if (p.q_length <= 0 || p.query_heads <= 0 || p.batch <= 0) return;
+  const bool single_vec = (p.value_dim == 8 * kLanes);
+  if (single_vec) {
+    if constexpr (kLanes == 16) {
+      const unsigned row_tiles = static_cast<unsigned>((p.q_length + 31) / 32);
+      const unsigned hq_groups = static_cast<unsigned>((p.query_heads + 3) / 4);
+      const dim3 grid(row_tiles, hq_groups, static_cast<unsigned>(p.batch));
+      detail::DeltaVectorKernel<E, kLanes, true>
+          <<<grid, detail::kPreprocessThreads, 0, stream>>>(
+              reinterpret_cast<const E*>(p.dy), reinterpret_cast<const E*>(p.saved), p.delta,
+              p.q_length, p.query_heads, p.value_dim);
+    } else {
+      constexpr int kRowsPerStep = detail::kPreprocessThreads / kLanes;
+      const unsigned row_tiles =
+          static_cast<unsigned>((p.q_length + kRowsPerStep - 1) / kRowsPerStep);
+      const unsigned hq_pairs = static_cast<unsigned>((p.query_heads + 1) / 2);
+      const dim3 grid(row_tiles, hq_pairs, static_cast<unsigned>(p.batch));
+      detail::DeltaVectorKernel<E, kLanes, true>
+          <<<grid, detail::kPreprocessThreads, 0, stream>>>(
+              reinterpret_cast<const E*>(p.dy), reinterpret_cast<const E*>(p.saved), p.delta,
+              p.q_length, p.query_heads, p.value_dim);
     }
+  } else {
+    constexpr int kRowsPerStep = detail::kPreprocessThreads / kLanes;
+    const unsigned row_tiles =
+        static_cast<unsigned>((p.q_length + kRowsPerStep - 1) / kRowsPerStep);
+    const unsigned hq_pairs = static_cast<unsigned>((p.query_heads + 1) / 2);
+    const dim3 grid(row_tiles, hq_pairs, static_cast<unsigned>(p.batch));
+    detail::DeltaVectorKernel<E, kLanes, false>
+        <<<grid, detail::kPreprocessThreads, 0, stream>>>(
+            reinterpret_cast<const E*>(p.dy), reinterpret_cast<const E*>(p.saved), p.delta,
+            p.q_length, p.query_heads, p.value_dim);
   }
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
-// The tables-only form of LaunchPreprocess, for a call whose delta another body already wrote
-// (p.saved null, p.delta set: the SoftDelta pair backward, whose gate backward emits both reads'
-// deltas): the tile bounds (one CTA per 64-row tile) and then the key tile range (one CTA per
-// 64-key tile), the same exact min/max tables the preprocess's block (0, 0, b) computes, spread
-// over the GPU instead of one block per batch row; no delta is computed or written.
 template <typename E>
 inline void LaunchPreprocessTables(const Params& p, cudaStream_t stream) {
-  Params mutable_p = p;
-  LaunchTileBounds(mutable_p, stream);
-  if (p.key_tile_range != nullptr) LaunchKeyTileRange(mutable_p, stream);
+  LaunchTileBoundsAndKeyRange(p, stream);
+}
+
+template <typename E>
+void BackwardDeltaOnly(const Params& p, cudaStream_t stream) {
+  const int64_t rows = p.batch * p.q_length * p.query_heads;
+  if (rows <= 0 || p.saved == nullptr || p.delta == nullptr) return;
+  const bool vectorized = !p.saved_fp32 && p.dy != nullptr && (p.value_dim % 8) == 0 &&
+                          p.value_dim >= 8 && (p.q_length * p.query_heads) < (int64_t(1) << 31) &&
+                          (reinterpret_cast<unsigned long long>(p.dy) % 16) == 0 &&
+                          (reinterpret_cast<unsigned long long>(p.saved) % 16) == 0;
+  if (vectorized) {
+    const bool fast_256 =
+        p.value_dim == 128 && (p.q_length % 32) == 0 && (p.query_heads % 32) == 0 &&
+        (reinterpret_cast<unsigned long long>(p.dy) % 32) == 0 &&
+        (reinterpret_cast<unsigned long long>(p.saved) % 32) == 0;
+    if (fast_256) {
+      const dim3 grid(static_cast<unsigned>(p.q_length / 32),
+                      static_cast<unsigned>(p.query_heads / 32),
+                      static_cast<unsigned>(p.batch));
+      detail::DeltaVector256H32Kernel<E>
+          <<<grid, detail::kPreprocessThreads, 0, stream>>>(
+              reinterpret_cast<const detail::DeltaVec32*>(p.dy),
+              reinterpret_cast<const detail::DeltaVec32*>(p.saved), p.delta,
+              static_cast<int>(p.q_length), static_cast<int>(p.query_heads));
+      C10_CUDA_KERNEL_LAUNCH_CHECK();
+      return;
+    }
+    const int64_t nvec = p.value_dim >> 3;
+    if (nvec >= 32) {
+      LaunchDeltaVector<E, 32>(p, stream);
+    } else if (nvec >= 16) {
+      LaunchDeltaVector<E, 16>(p, stream);
+    } else {
+      LaunchDeltaVector<E, 8>(p, stream);
+    }
+  } else {
+    constexpr int kRowsPerBlock = 8;
+    detail::DeltaKernel<E><<<static_cast<unsigned>((rows + kRowsPerBlock - 1) / kRowsPerBlock),
+                             kRowsPerBlock * 32, 0, stream>>>(p);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+  }
 }
 
 template <typename E>
@@ -129,34 +180,10 @@ void BackwardDeltaStage(const Params& p, cudaStream_t stream) {
     RecordPhase(Phase::kDelta, Body::kScalar, Body::kScalar, State::kRan);
     return;
   }
-  // Vector path: 16-B loads need dy and saved contiguous, 16-B aligned and a
-  // value dim that is a multiple of 8 (every bucket dim is). Otherwise the seed's
-  // scalar delta kernel runs, with the two table kernels beside it.
-  const bool vectorized = rows > 0 && !p.saved_fp32 && p.dy != nullptr && p.saved != nullptr &&
-                          p.delta != nullptr && (p.value_dim % 8) == 0 && p.value_dim >= 8 &&
-                          (reinterpret_cast<unsigned long long>(p.dy) % 16) == 0 &&
-                          (reinterpret_cast<unsigned long long>(p.saved) % 16) == 0;
-  if (vectorized) {
-    const int64_t nvec = p.value_dim >> 3;
-    if (nvec >= 32) {
-      LaunchPreprocess<E, 32>(p, stream);
-    } else if (nvec >= 16) {
-      LaunchPreprocess<E, 16>(p, stream);
-    } else {
-      LaunchPreprocess<E, 8>(p, stream);
-    }
-  } else if (rows > 0) {
-    Params mutable_p = p;
-    LaunchTileBounds(mutable_p, stream);
-    if (p.row_lo != nullptr) LaunchKeyTileRange(mutable_p, stream);
-    constexpr int kRowsPerBlock = 8;
-    detail::DeltaKernel<E><<<static_cast<unsigned>((rows + kRowsPerBlock - 1) / kRowsPerBlock),
-                             kRowsPerBlock * 32, 0, stream>>>(p);
-    C10_CUDA_KERNEL_LAUNCH_CHECK();
+  if (rows > 0) {
+    if (p.tile_bounds != nullptr) LaunchTileBoundsAndKeyRange(p, stream);
+    BackwardDeltaOnly<E>(p, stream);
   }
-  // The delta body is a scalar dot-product/reduction with no T::Mma, so its body
-  // is kScalar: labelling it with a tensor-core body would put a false row in the
-  // first phase every backward records.
   RecordPhase(Phase::kDelta, Body::kScalar, Body::kScalar, State::kRan);
 }
 
@@ -226,4 +253,9 @@ void BackwardCase(const Params& p, cudaStream_t stream) {
   template void ForwardCase<ELEMENT, D, DV>(const Params&, cudaStream_t);                    \
   template void BackwardCase<ELEMENT, D, DV>(const Params&, cudaStream_t);                   \
   template void BackwardStages<ELEMENT, D, DV>(const Params&, cudaStream_t, unsigned);       \
+  }
+
+#define XATTN_SCA_NATIVE_INSTANTIATE_ELEMENT(ELEMENT)                                        \
+  namespace xattn::ops::flash_sca_native {                                                   \
+  template void BackwardDeltaOnly<ELEMENT>(const Params&, cudaStream_t);                     \
   }

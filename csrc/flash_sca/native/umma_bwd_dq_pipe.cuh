@@ -107,6 +107,7 @@
 #include <utility>
 
 #include "flash_sca/native/bwd_pipe_host.h"
+#include "flash_sca/native/tma_load.cuh"
 #include "flash_sca/native/umma_bwd_dq.cuh"
 #include "flash_sca/native/umma_bwd_pt.cuh"  // the shared packed core (pt::FmaX2, ...)
 
@@ -1239,6 +1240,12 @@ struct FlatPlan {
   static constexpr int kDescOff = kXBarOff + 8 * kXBarCount;      // 2 x 32 B
   static constexpr int kProgOff = kDescOff + 64;                 // u32: S/dP steps issued
   static constexpr int kEnd = kProgOff + 8;
+  // Dedicated 1024-aligned 128B-swizzled dQ staging buffer for coalesced TMA stores (32 KB at D=128).
+  static constexpr int kDqStageOff = ((kEnd + 1023) / 1024) * 1024;
+  static constexpr int kDqStageBytes = Pl::kSlabsK * Pl::kSlab;
+  static constexpr int kFlatSmemBytes = kDqStageOff + kDqStageBytes + 1024;
+  static constexpr bool kUseTmaDqStore = kEligible && (kFlatSmemBytes <= 232448);
+  static constexpr int kSmemBytes = kUseTmaDqStore ? kFlatSmemBytes : Pl::kSmemBytes;
   // The scheduler claims tile it + 1 once the issuer is within kLook steps of tile it's end:
   // early enough to hide the claim and the bounds reduction, late enough that a claimed tile
   // does not wait behind a long one while other SMs run dry at the grid's tail.
@@ -1246,10 +1253,12 @@ struct FlatPlan {
   static constexpr int kDescEmptyCount = 3 + kPackWarps;         // producer, 2 issuers, 8 pack warps
   static_assert(!kEligible || ((kEnd + 1023) / 1024) * 1024 + 1024 <= Pl::kSmemBytes,
                 "the flat plan's extra barriers and descriptors fit the plan's SMEM image");
+  static_assert(!kUseTmaDqStore || (kDqStageOff % 1024 == 0 && kSmemBytes <= 232448),
+                "the flat plan's dQ TMA staging buffer is 1024-aligned and fits opt-in SMEM");
 };
 
 struct FlatDesc {
-  int32_t tile, t0, steps, min_lo, max_hi, max_lo, min_hi, pad;
+  int32_t qt, hq, b, t0, steps, max_lo, min_hi, pad;
 };
 
 template <class Elem, int kD, int kDv>
@@ -1286,8 +1295,7 @@ __global__ void __launch_bounds__(FlatPlan<kD, kDv>::kThreads, 1) DqFlatKernel(
   const int ch = (warp >> 2) & 1;
   const int row = 32 * w4 + lane;
   const int nqt = (p.q_length + kBM - 1) / kBM;
-  const int64_t nhq = p.query_heads;
-  const int64_t tiles_per_batch = static_cast<int64_t>(nqt) * nhq;
+  const int nhq = static_cast<int>(p.query_heads);
 
   if (warp == 0) {
     TmemAlloc(Pl::kAllocCols, tmem_slot);
@@ -1323,14 +1331,10 @@ __global__ void __launch_bounds__(FlatPlan<kD, kDv>::kThreads, 1) DqFlatKernel(
     __syncwarp(__activemask());
     if (lane == 0) MbarArrive(XATTN_DQF_XBAR(Fp::kBarDescEmpty + (it & 1)));
   };
-  auto decode = [&](int tile, int* qt, int64_t* hq, int64_t* b) {
-    *qt = tile % nqt;
-    *hq = (tile / nqt) % nhq;
-    *b = tile / tiles_per_batch;
-  };
 
   if (warp == Fp::kSchedWarp) {
     // ------------------------------------------------------------- scheduler
+    // LJF worklist order with hq fastest so the 4 GQA heads of each (b, qt) share K/V in L2.
     uint32_t g_end = 0;  // S/dP steps through the last tile described
     for (int it = 0;; ++it) {
       const int slot = it & 1;
@@ -1345,43 +1349,70 @@ __global__ void __launch_bounds__(FlatPlan<kD, kDv>::kThreads, 1) DqFlatKernel(
       if (lane == 0) tile = static_cast<int>(atomicAdd(tile_counter, 1u));
       tile = __shfl_sync(0xFFFFFFFFu, tile, 0);
       FlatDesc d{};
-      d.tile = tile < total_tiles ? tile : -1;
+      d.qt = -1;
       if (tile < total_tiles) {
-        int qt;
-        int64_t hq, b;
-        decode(tile, &qt, &hq, &b);
-        int lo = INT_MAX, hi = -1, mlo = INT_MIN, mhi = INT_MAX;
-        bool any_dead = false;
-        for (int k = 0; k < 4; ++k) {
-          const int64_t i = static_cast<int64_t>(qt) * kBM + 32 * k + lane;
-          const bool in = i < p.q_length;
-          const detail::Bounds bd = in ? detail::RowBounds(p, b, i) : detail::Bounds{INT_MAX, -1};
-          const bool live = in && bd.lo <= bd.hi;
-          lo = min(lo, live ? bd.lo : INT_MAX);
-          hi = max(hi, live ? bd.hi : -1);
-          // DqPipeKernel's max lo / min hi: a dead or absent row counts as INT_MAX / INT_MIN.
-          mlo = max(mlo, live ? bd.lo : INT_MAX);
-          mhi = min(mhi, live ? bd.hi : INT_MIN);
-          any_dead |= !live;
+        int qt = 0, hq = 0, b = 0;
+        if (lane == 0) {
+          const int pair_rank = tile / nhq;
+          hq = tile - pair_rank * nhq;
+          const int pair = (lp.q_ljf_order != nullptr) ? lp.q_ljf_order[pair_rank] : pair_rank;
+          b = pair / nqt;
+          qt = pair - b * nqt;
         }
-        (void)any_dead;
-        d.min_lo = WarpMin(lo);
-        d.max_hi = WarpMax(hi);
-        d.max_lo = WarpMax(mlo);
-        d.min_hi = WarpMin(mhi);
-        if (d.min_lo > d.max_hi) {
+        qt = __shfl_sync(0xFFFFFFFFu, qt, 0);
+        hq = __shfl_sync(0xFFFFFFFFu, hq, 0);
+        b = __shfl_sync(0xFFFFFFFFu, b, 0);
+        d.qt = qt;
+        d.hq = hq;
+        d.b = b;
+        int min_lo = INT_MAX, max_hi = -1, max_lo = INT_MIN, min_hi = INT_MAX;
+        if (p.tile_bounds != nullptr && static_cast<int64_t>(qt + 1) * kBM <= p.q_length) {
+          if (lane == 0) {
+            const int4* const tb = reinterpret_cast<const int4*>(
+                p.tile_bounds + (static_cast<int64_t>(b) * p.tile_count + 2 * qt) * 4);
+            const int4 e0 = tb[0];
+            const int4 e1 = tb[1];
+            min_lo = min(e0.x, e1.x);
+            max_hi = max(e0.y, e1.y);
+            max_lo = max(e0.z, e1.z);
+            min_hi = min(e0.w, e1.w);
+          }
+          min_lo = __shfl_sync(0xFFFFFFFFu, min_lo, 0);
+          max_hi = __shfl_sync(0xFFFFFFFFu, max_hi, 0);
+          max_lo = __shfl_sync(0xFFFFFFFFu, max_lo, 0);
+          min_hi = __shfl_sync(0xFFFFFFFFu, min_hi, 0);
+        } else {
+          int lo = INT_MAX, hi = -1, mlo = INT_MIN, mhi = INT_MAX;
+          for (int k = 0; k < 4; ++k) {
+            const int64_t i = static_cast<int64_t>(qt) * kBM + 32 * k + lane;
+            const bool in = i < p.q_length;
+            const detail::Bounds bd = in ? detail::RowBounds(p, b, i) : detail::Bounds{INT_MAX, -1};
+            const bool live = in && bd.lo <= bd.hi;
+            lo = min(lo, live ? bd.lo : INT_MAX);
+            hi = max(hi, live ? bd.hi : -1);
+            mlo = max(mlo, live ? bd.lo : INT_MAX);
+            mhi = min(mhi, live ? bd.hi : INT_MIN);
+          }
+          min_lo = WarpMin(lo);
+          max_hi = WarpMax(hi);
+          max_lo = WarpMax(mlo);
+          min_hi = WarpMin(mhi);
+        }
+        d.max_lo = max_lo;
+        d.min_hi = min_hi;
+        if (min_lo > max_hi) {
           d.steps = 0;
           d.t0 = 0;
         } else {
-          d.t0 = d.min_lo / kBN;
-          d.steps = d.max_hi / kBN - d.t0 + 1;
+          d.t0 = min_lo / kBN;
+          d.steps = max_hi / kBN - d.t0 + 1;
         }
       }
-      if (d.tile >= 0) g_end += static_cast<uint32_t>(d.steps);
+      if (d.qt >= 0) g_end += static_cast<uint32_t>(d.steps);
       if (lane == 0) descs[slot] = d;
       __syncwarp();
       if (lane == 0) MbarArrive(XATTN_DQF_XBAR(Fp::kBarDescFull + slot));
-      if (d.tile < 0) break;
+      if (d.qt < 0) break;
     }
   } else if (warp == kProducerWarp) {
     // ------------------------------------------------------------- TMA producer
@@ -1392,53 +1423,37 @@ __global__ void __launch_bounds__(FlatPlan<kD, kDv>::kThreads, 1) DqFlatKernel(
         FlatDesc d;
         read_desc(it, &d);
         release_desc(it);
-        if (d.tile < 0) break;
+        if (d.qt < 0) break;
         if (d.steps == 0) continue;
-        int qt;
-        int64_t hq, b;
-        decode(d.tile, &qt, &hq, &b);
-        const int64_t kvh = p.group > 0 ? hq / p.group : hq;
+        const int qt = d.qt;
+        const int hq = d.hq;
+        const int b = d.b;
+        const int kvh = p.group > 0 ? hq / static_cast<int>(p.group) : hq;
         // The landing tiles are free once the previous live tile's copies into TMEM are done.
         if (live_i >= 1) MbarWait(XATTN_DQF_XBAR(Fp::kBarQFree), static_cast<uint32_t>((live_i - 1) & 1));
-        MbarArriveExpectTx(XATTN_DQF_BAR(kBarQ), Pl::kQBytes);
-        for (int s = 0; s < Pl::kSlabsQ; ++s) {
-          for (int r = 0; r < kBM; r += kTmaRows) {
-            TmaLoad4D(sq + s * Pl::kSlab + r * 128, &lp.maps.q, XATTN_DQF_BAR(kBarQ), s * 64,
-                      static_cast<int>(hq), qt * kBM + r, static_cast<int>(b));
-          }
-        }
+        // Issue dO first so the S/dP issuer can copy dO and launch dP(G) while S(last_s) finishes.
         MbarArriveExpectTx(XATTN_DQF_BAR(kBarDy), Pl::kDyBytes);
+#pragma unroll
         for (int s = 0; s < Pl::kSlabsV; ++s) {
+#pragma unroll
           for (int r = 0; r < kBM; r += kTmaRows) {
             TmaLoad4D(sdy + s * Pl::kSlab + r * 128, &lp.maps.dy, XATTN_DQF_BAR(kBarDy), s * 64,
-                      static_cast<int>(hq), qt * kBM + r, static_cast<int>(b));
+                      hq, qt * kBM + r, b);
+          }
+        }
+        MbarArriveExpectTx(XATTN_DQF_BAR(kBarQ), Pl::kQBytes);
+#pragma unroll
+        for (int s = 0; s < Pl::kSlabsQ; ++s) {
+#pragma unroll
+          for (int r = 0; r < kBM; r += kTmaRows) {
+            TmaLoad4D(sq + s * Pl::kSlab + r * 128, &lp.maps.q, XATTN_DQF_BAR(kBarQ), s * 64,
+                      hq, qt * kBM + r, b);
           }
         }
         int nk = 0, nv = 0;
         uint32_t idle = 0;
         while (nk < d.steps || nv < d.steps) {
           bool moved = false;
-          const uint32_t g = gk + nk;
-          if (nk < d.steps &&
-              (g < static_cast<uint32_t>(kKS) ||
-               MbarTestWait(XATTN_DQF_BAR(kBarKfree + g % kKS), ((g - kKS) / kKS) & 1u))) {
-            const int64_t j0 = static_cast<int64_t>(d.t0 + nk) * kBN;
-            const CUtensorMap* kmap;
-            const CUtensorMap* vmap;
-            int row0;
-            ResolveKeyMap(lp, j0, &kmap, &vmap, &row0);
-            const uint32_t bk = XATTN_DQF_BAR(kBarK + g % kKS);
-            MbarArriveExpectTx(bk, Pl::kKStageBytes);
-            unsigned char* const kdst = sk + (g % kKS) * Pl::kKStageBytes;
-            for (int s = 0; s < Pl::kSlabsK; ++s) {
-              for (int r = 0; r < kBN; r += kTmaRows) {
-                TmaLoad4D(kdst + s * Pl::kKvSlab + r * 128, kmap, bk, s * 64,
-                          static_cast<int>(kvh), row0 + r, static_cast<int>(b));
-              }
-            }
-            ++nk;
-            moved = true;
-          }
           const uint32_t gvv = gv + nv;
           if (nv < d.steps &&
               (gvv < static_cast<uint32_t>(kVS) ||
@@ -1451,13 +1466,36 @@ __global__ void __launch_bounds__(FlatPlan<kD, kDv>::kThreads, 1) DqFlatKernel(
             const uint32_t bv = XATTN_DQF_BAR(kBarV + gvv % kVS);
             unsigned char* const vdst = sv + (gvv % kVS) * Pl::kVStageBytes;
             MbarArriveExpectTx(bv, Pl::kVBytes);
+#pragma unroll
             for (int s = 0; s < Pl::kSlabsV; ++s) {
+#pragma unroll
               for (int r = 0; r < kBN; r += kTmaRows) {
-                TmaLoad4D(vdst + s * Pl::kKvSlab + r * 128, vmap, bv, s * 64,
-                          static_cast<int>(kvh), row0 + r, static_cast<int>(b));
+                TmaLoad4D(vdst + s * Pl::kKvSlab + r * 128, vmap, bv, s * 64, kvh, row0 + r, b);
               }
             }
             ++nv;
+            moved = true;
+          }
+          const uint32_t g = gk + nk;
+          if (nk < d.steps &&
+              (g < static_cast<uint32_t>(kKS) ||
+               MbarTestWait(XATTN_DQF_BAR(kBarKfree + g % kKS), ((g - kKS) / kKS) & 1u))) {
+            const int64_t j0 = static_cast<int64_t>(d.t0 + nk) * kBN;
+            const CUtensorMap* kmap;
+            const CUtensorMap* vmap;
+            int row0;
+            ResolveKeyMap(lp, j0, &kmap, &vmap, &row0);
+            const uint32_t bk = XATTN_DQF_BAR(kBarK + g % kKS);
+            MbarArriveExpectTx(bk, Pl::kKStageBytes);
+            unsigned char* const kdst = sk + (g % kKS) * Pl::kKStageBytes;
+#pragma unroll
+            for (int s = 0; s < Pl::kSlabsK; ++s) {
+#pragma unroll
+              for (int r = 0; r < kBN; r += kTmaRows) {
+                TmaLoad4D(kdst + s * Pl::kKvSlab + r * 128, kmap, bk, s * 64, kvh, row0 + r, b);
+              }
+            }
+            ++nk;
             moved = true;
           }
           if (moved) {
@@ -1479,38 +1517,48 @@ __global__ void __launch_bounds__(FlatPlan<kD, kDv>::kThreads, 1) DqFlatKernel(
     const uint32_t ss_idesc = MakeInstrDesc(elem_fmt, kBM, kBN, 0, 0);
     const uint32_t dq_lbo = Pl::kSlabsK > 1 ? static_cast<uint32_t>(kBN * 8) : 0u;
     const uint32_t dq_idesc = MakeInstrDesc(elem_fmt, kBM, kD <= 256 ? kD : 256, 0, 1);
-    const uint32_t qb_smem = SmemAddr(sq);
-    const uint32_t dyb_smem = SmemAddr(sdy);
-    const uint32_t k0_smem = SmemAddr(sk);
-    const uint32_t v0_smem = SmemAddr(sv);
-    // DqPipeKernel's issue bodies at the resident-Q/dO map, indexed by the GLOBAL step g.
-    auto issue_s = [&](uint32_t g) {
-      const uint32_t kb_smem = k0_smem + (g % kKS) * Pl::kKStageBytes;
+    const uint64_t q_desc0 = MakeSmemDesc(SmemAddr(sq)).value;
+    const uint64_t dy_desc0 = MakeSmemDesc(SmemAddr(sdy)).value;
+    const uint64_t k_desc0 = MakeSmemDesc(SmemAddr(sk)).value;
+    const uint64_t v_desc0 = MakeSmemDesc(SmemAddr(sv)).value;
+    const uint64_t dq_k_desc0 = MakeSmemDesc(SmemAddr(sk), dq_lbo, 64).value;
+
+    // Raw single-elected issue bodies using precomputed 64-bit SMEM descriptors (no per-MMA
+    // ElectOne, no 4-reg zero disable vector, no descriptor bit-packing rebuild).
+    auto issue_s_raw = [&](uint32_t g) {
+      const uint64_t kb_desc =
+          k_desc0 + static_cast<uint64_t>((g % kKS) * (Pl::kKStageBytes >> 4));
       const uint32_t dst = tbase + Pl::kSCol + (g & 1u) * Pl::kBufCols;
+#pragma unroll
       for (int kk = 0; kk < kD / 16; ++kk) {
         const int slab = kk >> 2, within = kk & 3;
-        MmaTs(dst, tbase + static_cast<uint32_t>(Pl::kQCol + 8 * kk),
-              MakeSmemDesc(kb_smem + slab * Pl::kKvSlab + within * 32), ss_idesc,
-              kk == 0 ? 0u : 1u);
+        MmaTsRaw(dst, tbase + static_cast<uint32_t>(Pl::kQCol + 8 * kk),
+                 kb_desc + static_cast<uint64_t>((slab * Pl::kKvSlab + within * 32) >> 4),
+                 ss_idesc, kk == 0 ? 0u : 1u);
       }
     };
-    auto issue_dp = [&](uint32_t g) {
+    auto issue_dp_raw = [&](uint32_t g) {
       const uint32_t dst = tbase + Pl::kDpCol + (g & 1u) * Pl::kBufCols;
-      const uint32_t vb_smem = v0_smem + (g % kVS) * Pl::kVStageBytes;
+      const uint64_t vb_desc =
+          v_desc0 + static_cast<uint64_t>((g % kVS) * (Pl::kVStageBytes >> 4));
+#pragma unroll
       for (int sl = 0; sl < Pl::kSlabsV; ++sl) {
+#pragma unroll
         for (int kk = 0; kk < 4; ++kk) {
-          MmaTs(dst, tbase + static_cast<uint32_t>(Pl::kDoCol + 8 * (4 * sl + kk)),
-                MakeSmemDesc(vb_smem + sl * Pl::kKvSlab + kk * 32), ss_idesc,
-                (sl == 0 && kk == 0) ? 0u : 1u);
+          MmaTsRaw(dst, tbase + static_cast<uint32_t>(Pl::kDoCol + 8 * (4 * sl + kk)),
+                   vb_desc + static_cast<uint64_t>((sl * Pl::kKvSlab + kk * 32) >> 4),
+                   ss_idesc, (sl == 0 && kk == 0) ? 0u : 1u);
         }
       }
     };
-    auto issue_dq = [&](uint32_t g, bool first) {
-      const uint32_t kb_smem = k0_smem + (g % kKS) * Pl::kKStageBytes;
+    auto issue_dq_raw = [&](uint32_t g, bool first) {
+      const uint64_t kb_desc =
+          dq_k_desc0 + static_cast<uint64_t>((g % kKS) * (Pl::kKStageBytes >> 4));
+#pragma unroll
       for (int kk = 0; kk < kBN / 16; ++kk) {
-        MmaTs(tbase + Pl::kDqCol, tbase + DsColumn(Pl::kSCol, g & 1u, kk),
-              MakeSmemDesc(kb_smem + kk * 16 * 128, dq_lbo, 64), dq_idesc,
-              (first && kk == 0) ? 0u : 1u);
+        MmaTsRaw(tbase + Pl::kDqCol, tbase + DsColumn(Pl::kSCol, g & 1u, kk),
+                 kb_desc + static_cast<uint64_t>((kk * 16 * 128) >> 4), dq_idesc,
+                 (first && kk == 0) ? 0u : 1u);
       }
     };
     auto wait_v = [&](uint32_t g) {
@@ -1526,7 +1574,7 @@ __global__ void __launch_bounds__(FlatPlan<kD, kDv>::kThreads, 1) DqFlatKernel(
         FlatDesc d;
         read_desc(it, &d);
         release_desc(it);
-        if (d.tile < 0) break;
+        if (d.qt < 0) break;
         if (d.steps == 0) continue;
         for (int n = 0; n < d.steps; ++n) {
           const uint32_t g = G + n;
@@ -1537,9 +1585,11 @@ __global__ void __launch_bounds__(FlatPlan<kD, kDv>::kThreads, 1) DqFlatKernel(
           }
           TmemFenceAfterSync();
           __syncwarp();
-          issue_dq(g, n == 0);
-          MmaCommit(XATTN_DQF_BAR(kBarDq + (g & 1u)));
-          MmaCommit(XATTN_DQF_BAR(kBarKfree + g % kKS));
+          if (ElectOne()) {
+            issue_dq_raw(g, n == 0);
+            MmaCommitRaw(XATTN_DQF_BAR(kBarDq + (g & 1u)));
+            MmaCommitRaw(XATTN_DQF_BAR(kBarKfree + g % kKS));
+          }
         }
         G += d.steps;
         ++live_i;
@@ -1550,46 +1600,86 @@ __global__ void __launch_bounds__(FlatPlan<kD, kDv>::kThreads, 1) DqFlatKernel(
         FlatDesc d;
         read_desc(it, &d);
         release_desc(it);
-        if (d.tile < 0) break;
+        if (d.qt < 0) break;
         if (d.steps == 0) continue;
-        // Q / dO columns are read by every S / dP of the previous tile: all complete.
+        // Overlap dO copy + dP(G) with the previous tile's S(last_s): dP(last_s) (last reader of
+        // kDoCol) completed on kBarVfree[last_s % kVS], while S(last_s) only reads kQCol.
+        if (last_s >= 0) {
+          const uint32_t ls = static_cast<uint32_t>(last_s);
+          MbarWait(XATTN_DQF_BAR(kBarVfree + ls % kVS), (ls / kVS) & 1u);
+        }
+        MbarWait(XATTN_DQF_BAR(kBarDy), static_cast<uint32_t>(live_i & 1));
+        TmemFenceAfterSync();
+        __syncwarp();
+        if (ElectOne()) {
+#pragma unroll
+          for (int kk = 0; kk < kDv / 16; ++kk) {
+            TmemCopy128x256bRaw(
+                tbase + static_cast<uint32_t>(Pl::kDoCol + 8 * kk),
+                dy_desc0 + static_cast<uint64_t>(((kk >> 2) * Pl::kSlab + (kk & 3) * 32) >> 4));
+          }
+        }
+        // Step 0 dP(G) immediately behind dO copy (same thread: cp -> mma pipelined).
+        if (G >= 2) {
+          MbarWait(XATTN_DQF_BAR(kBarPack + (G & 1u)), ((G - 2) >> 1) & 1u);
+          TmemFenceAfterSync();
+        }
+        wait_v(G);
+        __syncwarp();
+        if (ElectOne()) {
+          issue_dp_raw(G);
+          MmaCommitRaw(XATTN_DQF_BAR(kBarVfree + G % kVS));
+        }
+        // S(last_s) (last reader of kQCol) must complete before tcgen05.cp overwrites kQCol
+        // (PTX 9.7.17.6.2: mma -> cp is not implicitly pipelined).
         if (last_s >= 0) {
           MbarWait(XATTN_DQF_BAR(kBarS + (last_s & 1)), static_cast<uint32_t>((last_s >> 1) & 1));
         }
         MbarWait(XATTN_DQF_BAR(kBarQ), static_cast<uint32_t>(live_i & 1));
-        MbarWait(XATTN_DQF_BAR(kBarDy), static_cast<uint32_t>(live_i & 1));
         TmemFenceAfterSync();
         __syncwarp();
-        for (int kk = 0; kk < kD / 16; ++kk) {
-          TmemCopy128x256b(tbase + static_cast<uint32_t>(Pl::kQCol + 8 * kk),
-                           MakeSmemDesc(qb_smem + (kk >> 2) * Pl::kSlab + (kk & 3) * 32));
+        if (ElectOne()) {
+#pragma unroll
+          for (int kk = 0; kk < kD / 16; ++kk) {
+            TmemCopy128x256bRaw(
+                tbase + static_cast<uint32_t>(Pl::kQCol + 8 * kk),
+                q_desc0 + static_cast<uint64_t>(((kk >> 2) * Pl::kSlab + (kk & 3) * 32) >> 4));
+          }
+          // Covers both TmemCopy(dO) and TmemCopy(Q), releasing both SMEM landing tiles.
+          MmaCommitRaw(XATTN_DQF_XBAR(Fp::kBarQFree));
         }
-        for (int kk = 0; kk < kDv / 16; ++kk) {
-          TmemCopy128x256b(tbase + static_cast<uint32_t>(Pl::kDoCol + 8 * kk),
-                           MakeSmemDesc(dyb_smem + (kk >> 2) * Pl::kSlab + (kk & 3) * 32));
+        // Step 0 S(G).
+        wait_k(G);
+        if (G >= 2) MbarWait(XATTN_DQF_BAR(kBarDq + (G & 1u)), ((G - 2) >> 1) & 1u);
+        TmemFenceAfterSync();
+        __syncwarp();
+        if (ElectOne()) {
+          issue_s_raw(G);
+          MmaCommitRaw(XATTN_DQF_BAR(kBarS + (G & 1u)));
         }
-        MmaCommit(XATTN_DQF_XBAR(Fp::kBarQFree));
-        // S / dP(g) for the tile's steps; the buffers' previous readers are pack(g - 2) (dP)
-        // and dQ(g - 2) (S, where dS(g - 2) lives), in this tile or the previous one.
-        auto issue_sdp = [&](uint32_t g) {
+        if (lane == 0) *sdp_issued = G + 1;
+        // Remaining steps n = 1 .. d.steps - 1.
+        for (int n = 1; n < d.steps; ++n) {
+          const uint32_t g = G + n;
           if (g >= 2) {
             MbarWait(XATTN_DQF_BAR(kBarPack + (g & 1u)), ((g - 2) >> 1) & 1u);
             TmemFenceAfterSync();
           }
           wait_v(g);
           __syncwarp();
-          issue_dp(g);
-          MmaCommit(XATTN_DQF_BAR(kBarVfree + g % kVS));
+          if (ElectOne()) {
+            issue_dp_raw(g);
+            MmaCommitRaw(XATTN_DQF_BAR(kBarVfree + g % kVS));
+          }
           wait_k(g);
           if (g >= 2) MbarWait(XATTN_DQF_BAR(kBarDq + (g & 1u)), ((g - 2) >> 1) & 1u);
           TmemFenceAfterSync();
           __syncwarp();
-          issue_s(g);
-          MmaCommit(XATTN_DQF_BAR(kBarS + (g & 1u)));
-        };
-        for (int n = 0; n < d.steps; ++n) {
-          issue_sdp(G + n);
-          if (lane == 0) *sdp_issued = G + n + 1;
+          if (ElectOne()) {
+            issue_s_raw(g);
+            MmaCommitRaw(XATTN_DQF_BAR(kBarS + (g & 1u)));
+          }
+          if (lane == 0) *sdp_issued = g + 1;
         }
         last_s = static_cast<int64_t>(G) + d.steps - 1;
         G += d.steps;
@@ -1605,11 +1695,7 @@ __global__ void __launch_bounds__(FlatPlan<kD, kDv>::kThreads, 1) DqFlatKernel(
     const int grp = warp >> 2;
     int64_t* const kseg_g = kseg + grp * kBN;
     const float sl2 = p.scale_log2;
-    const void* const saved_base =
-        p.saved != nullptr ? p.saved
-                           : (p.saved_fp32 ? static_cast<const void*>(p.y_state)
-                                           : static_cast<const void*>(p.y));
-    // The row constants of one tile (DqPipeKernel's expressions).
+    // The row constants of one tile (DqFlatKernel is gated on p.delta != nullptr).
     struct RowC {
       int64_t b, hq, i;
       bool in, lse_ok, seg;
@@ -1619,16 +1705,13 @@ __global__ void __launch_bounds__(FlatPlan<kD, kDv>::kThreads, 1) DqFlatKernel(
     };
     auto row_consts = [&](const FlatDesc& d) {
       RowC r;
-      int qt;
-      decode(d.tile, &qt, &r.hq, &r.b);
-      r.i = static_cast<int64_t>(qt) * kBM + row;
+      r.hq = d.hq;
+      r.b = d.b;
+      r.i = static_cast<int64_t>(d.qt) * kBM + row;
       r.in = r.i < p.q_length;
-      // The row's loads are issued independently of each other (the values they feed are the
-      // same as DqPipeKernel's chained form: lse and delta are only used where the row is live
-      // and its lse finite), so their latencies overlap instead of adding up.
       const int64_t stat = (r.b * p.query_heads + r.hq) * p.q_length + r.i;
       const float lse_raw = (r.in && p.lse_in != nullptr) ? p.lse_in[stat] : -INFINITY;
-      const float delta_raw = (r.in && p.delta != nullptr) ? p.delta[stat] : 0.f;
+      const float delta_raw = r.in ? p.delta[stat] : 0.f;
       r.seg = detail::SegmentTest(p, r.b);
       r.qseg = (r.seg && r.in) ? p.q_segment[r.b * p.q_length + r.i] : 0;
       r.bd = r.in ? detail::RowBounds(p, r.b, r.i) : detail::Bounds{INT_MAX, -1};
@@ -1636,38 +1719,21 @@ __global__ void __launch_bounds__(FlatPlan<kD, kDv>::kThreads, 1) DqFlatKernel(
       const float lse_i = live ? lse_raw : -INFINITY;
       r.lse_ok = live && lse_i > -INFINITY && lse_i < INFINITY;
       r.lse_log2 = r.lse_ok ? lse_i * kDqLog2e : INFINITY;
-      r.delta = 0.f;
-      if (r.lse_ok && p.delta != nullptr) {
-        r.delta = delta_raw;
-      } else if (r.lse_ok) {
-        const int64_t row0 = ((r.b * p.q_length + r.i) * p.query_heads + r.hq) * p.value_dim;
-        const Elem* const dy_row = reinterpret_cast<const Elem*>(p.dy) + row0;
-        float acc = 0.f;
-        if (p.saved_fp32) {
-          const float* const y_row = static_cast<const float*>(saved_base) + row0;
-          for (int64_t c = 0; c < p.value_dim; ++c) acc += ToFloat(dy_row[c]) * y_row[c];
-        } else {
-          const Elem* const y_row = static_cast<const Elem*>(saved_base) + row0;
-          for (int64_t c = 0; c < p.value_dim; ++c) acc += ToFloat(dy_row[c]) * ToFloat(y_row[c]);
-        }
-        r.delta = acc;
-      }
+      r.delta = r.lse_ok ? delta_raw : 0.f;
       return r;
     };
     uint32_t G = 0;
     int live_i = 0;
     const int64_t nt_total = p.total_length;
-    // The pack warps release a descriptor slot only when its tile is done (below, and on the dead
-    // path), so the scheduler claims at most one tile ahead of the tile being packed: claiming
-    // further ahead would lengthen the grid's tail on uniform heavy masks. The next tile's
-    // descriptor and row constants are read during the current tile (`prefetch`), so their
-    // global-load latency is off the path between two tiles.
+    unsigned char* const sdq = smem + Fp::kDqStageOff;
+    const int gt_grp = tid - 4 * 32 * grp;
+    bool pending_tma_store = false;
     FlatDesc d;
     read_desc(0, &d);
     RowC rc{};
-    if (d.tile >= 0) rc = row_consts(d);
+    if (d.qt >= 0) rc = row_consts(d);
     for (int it = 0;; ++it) {
-      if (d.tile < 0) break;
+      if (d.qt < 0) break;
       FlatDesc dn{};
       RowC rcn{};
       bool pre = false;
@@ -1679,19 +1745,34 @@ __global__ void __launch_bounds__(FlatPlan<kD, kDv>::kThreads, 1) DqFlatKernel(
         const bool ready = __all_sync(0xFFFFFFFFu, MbarTestWait(nbar, nph));
         if (!ready && !block) return;
         read_desc(it + 1, &dn);
-        if (dn.tile >= 0) rcn = row_consts(dn);
+        if (dn.qt >= 0) rcn = row_consts(dn);
         pre = true;
       };
       if (d.steps == 0) {
-        // No live row in this tile: dQ = 0 for every row in range (DqPipeKernel's dead tile).
-        if (rc.in) {
-          Elem* dqrow = reinterpret_cast<Elem*>(p.dq) +
-                        ((rc.b * p.q_length + rc.i) * p.query_heads + rc.hq) * p.qk_dim;
-          const int64_t half = (p.qk_dim + 1) / 2;
-          const int64_t c_begin = ch == 0 ? 0 : half;
-          const int64_t c_end = ch == 0 ? half : p.qk_dim;
-          for (int64_t c = c_begin; c < c_end; ++c) dqrow[c] = ElemTraits<Elem>::From(0.f);
+        // No live row in this tile: dQ = 0 for every row in range (coalesced TMA store).
+        if (pending_tma_store) {
+          if (gt_grp == 0) TmaStoreWaitRead();
+          GroupBarrierSync(grp);
         }
+        if (rc.in) {
+          uint4* const chunks = reinterpret_cast<uint4*>(sdq + ch * Pl::kSlab + row * 128);
+          const int swz = row & 7;
+          const uint4 z = make_uint4(0u, 0u, 0u, 0u);
+#pragma unroll
+          for (int i = 0; i < 8; ++i) chunks[i ^ swz] = z;
+        }
+        FenceProxyAsyncShared();
+        GroupBarrierSync(grp);
+        if (gt_grp == 0) {
+          const uint32_t sbase = SmemAddr(sdq + ch * Pl::kSlab);
+#pragma unroll
+          for (int r = 0; r < kBM; r += kTmaRows) {
+            TmaStoreAtom(&lp.maps.dq, sbase + static_cast<uint32_t>(r * 128),
+                         ch * 64, d.hq, d.qt * kBM + r, d.b);
+          }
+          TmaStoreCommit();
+        }
+        pending_tma_store = true;
         prefetch(true);
         release_desc(it);
         d = dn;
@@ -1723,6 +1804,13 @@ __global__ void __launch_bounds__(FlatPlan<kD, kDv>::kThreads, 1) DqFlatKernel(
         return vis;
       };
       auto pack_cols = [&](uint32_t buf, int cb, uint32_t vis) {
+        if (__all_sync(0xFFFFFFFFu, vis == 0u)) {
+          uint32_t z[kHalf / 2];
+#pragma unroll
+          for (int i = 0; i < kHalf / 2; ++i) z[i] = 0u;
+          TmemStore16(lane_base | (tbase + DsBase(Pl::kSCol, buf) + static_cast<uint32_t>(cb)), z);
+          return;
+        }
         float s[32];
         float dpr[32];
         TmemLoad32(lane_base | (tbase + Pl::kSCol + buf * Pl::kBufCols + cb), s);
@@ -1782,8 +1870,6 @@ __global__ void __launch_bounds__(FlatPlan<kD, kDv>::kThreads, 1) DqFlatKernel(
       }
       prefetch(true);
       // ----------------------------------------------------------------- epilogue
-      // dQ(last - 1) (when the tile has it) and then dQ(last): see the parity argument in the
-      // flat form's header comment (each wait's previous phase completed before it is taken).
       const uint32_t gl = G + d.steps - 1;
       if (d.steps >= 2) {
         MbarWait(XATTN_DQF_BAR(kBarDq + ((gl - 1) & 1u)), ((gl - 1) >> 1) & 1u);
@@ -1803,38 +1889,55 @@ __global__ void __launch_bounds__(FlatPlan<kD, kDv>::kThreads, 1) DqFlatKernel(
       TmemFenceBeforeSync();
       MbarArrive(XATTN_DQF_XBAR(Fp::kBarDrained));
       release_desc(it);
+      // Coalesced per-group TMA store (DqFlatKernel is gated on Fp::kUseTmaDqStore && has_dq_map).
+      if (pending_tma_store) {
+        if (gt_grp == 0) TmaStoreWaitRead();
+        GroupBarrierSync(grp);
+      }
       if (rc.in) {
-        Elem* const dqrow =
-            reinterpret_cast<Elem*>(p.dq) + ((rc.b * p.q_length + rc.i) * p.query_heads + rc.hq) * p.qk_dim;
-        const float scale = p.scale;
-        for (int cc = 0; cc < kD / 2; cc += 32) {
-          const int col0 = cbeg + cc;
-          if (col0 + 32 <= p.qk_dim && (reinterpret_cast<uintptr_t>(dqrow + col0) & 15u) == 0u) {
+        uint4* const chunks = reinterpret_cast<uint4*>(sdq + ch * Pl::kSlab + row * 128);
+        const int swz = row & 7;
+        if (rc.lse_ok) {
+          const float2 sc2 = make_float2(p.scale, p.scale);
+#pragma unroll
+          for (int cc = 0; cc < kD / 2; cc += 32) {
             union {
               uint4 u4[4];
-              Elem e[32];
+              uint32_t w[16];
             } pk;
 #pragma unroll
-            for (int x = 0; x < 32; ++x) pk.e[x] = ElemTraits<Elem>::From(rc.lse_ok ? o[cc + x] * scale : 0.f);
-            uint4* const dst = reinterpret_cast<uint4*>(dqrow + col0);
-            dst[0] = pk.u4[0];
-            dst[1] = pk.u4[1];
-            dst[2] = pk.u4[2];
-            dst[3] = pk.u4[3];
-          } else {
-            for (int x = 0; x < 32; ++x) {
-              const int64_t col = col0 + x;
-              if (col >= p.qk_dim) break;
-              dqrow[col] = ElemTraits<Elem>::From(rc.lse_ok ? o[cc + x] * scale : 0.f);
+            for (int x = 0; x < 16; ++x) {
+              const float2 m = pt::MulX2(make_float2(o[cc + 2 * x], o[cc + 2 * x + 1]), sc2);
+              pk.w[x] = pt::Pack2Fast<Elem>::Of(m.x, m.y);
             }
+            const int chunk0 = cc >> 3;
+#pragma unroll
+            for (int i = 0; i < 4; ++i) chunks[(chunk0 + i) ^ swz] = pk.u4[i];
           }
+        } else {
+          const uint4 z = make_uint4(0u, 0u, 0u, 0u);
+#pragma unroll
+          for (int i = 0; i < 8; ++i) chunks[i ^ swz] = z;
         }
       }
+      FenceProxyAsyncShared();
+      GroupBarrierSync(grp);
+      if (gt_grp == 0) {
+        const uint32_t sbase = SmemAddr(sdq + ch * Pl::kSlab);
+#pragma unroll
+        for (int r = 0; r < kBM; r += kTmaRows) {
+          TmaStoreAtom(&lp.maps.dq, sbase + static_cast<uint32_t>(r * 128),
+                       ch * 64, d.hq, d.qt * kBM + r, d.b);
+        }
+        TmaStoreCommit();
+      }
+      pending_tma_store = true;
       G += d.steps;
       ++live_i;
       d = dn;
       rc = rcn;
     }
+    if (pending_tma_store && gt_grp == 0) TmaStoreWaitRead();
   }
 
   TmemFenceBeforeSync();
@@ -1944,16 +2047,17 @@ void LaunchDqPipeKernel(const UmmaLaunchParams& lp, cudaStream_t stream) {
   int blocks = DqPipeSmCount() * (Pl::kTwoCta ? 2 : 1);
   if (blocks > total_tiles) blocks = total_tiles;
   if (blocks < 1) blocks = 1;
-  unsigned int* const counter = DqPipeTileCounter(stream);
+  unsigned int* const counter = (lp.dq_counter != nullptr) ? lp.dq_counter : DqPipeTileCounter(stream);
   const dim3 grid(static_cast<unsigned>(blocks));
-  if constexpr (FlatPlan<kD, kDv>::kEligible) {
-    if (DqFlatEnabled()) {
+  if constexpr (FlatPlan<kD, kDv>::kUseTmaDqStore) {
+    if (DqFlatEnabled() && p.delta != nullptr && lp.maps.has_dq_map) {
+      constexpr int kFlatSmem = FlatPlan<kD, kDv>::kSmemBytes;
       const cudaError_t fattr = cudaFuncSetAttribute(
-          DqFlatKernel<E, kD, kDv>, cudaFuncAttributeMaxDynamicSharedMemorySize, Pl::kSmemBytes);
+          DqFlatKernel<E, kD, kDv>, cudaFuncAttributeMaxDynamicSharedMemorySize, kFlatSmem);
       if (fattr != cudaSuccess) {
         dq_detail::RaiseCuda("flash_sca native bwd dQ flat: cudaFuncSetAttribute", fattr);
       }
-      DqFlatKernel<E, kD, kDv><<<grid, FlatPlan<kD, kDv>::kThreads, Pl::kSmemBytes, stream>>>(
+      DqFlatKernel<E, kD, kDv><<<grid, FlatPlan<kD, kDv>::kThreads, kFlatSmem, stream>>>(
           lp, counter, total_tiles);
       const cudaError_t flaunched = cudaGetLastError();
       if (flaunched != cudaSuccess) {

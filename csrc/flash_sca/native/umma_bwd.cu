@@ -13,6 +13,7 @@
 #include <vector>
 
 #include "flash_sca/native/dispatch_tag.cuh"
+#include "flash_sca/native/row_bounds.h"
 #include "flash_sca/native/umma_bwd.h"
 #include "flash_sca/native/kv_companion.h"
 
@@ -541,45 +542,75 @@ bool CheckBackwardPhases(const Params& params, const umma::UmmaLaunchParams& nat
   return true;
 }
 
+namespace {
+struct CachedBwdEvents {
+  int dev = -1;
+  cudaEvent_t ready = nullptr;
+  cudaEvent_t done = nullptr;
+  ~CachedBwdEvents() {
+    if (ready) (void)cudaEventDestroy(ready);
+    if (done) (void)cudaEventDestroy(done);
+  }
+  void Ensure(int device) {
+    if (dev == device && ready != nullptr && done != nullptr) return;
+    if (ready) (void)cudaEventDestroy(ready);
+    if (done) (void)cudaEventDestroy(done);
+    ready = done = nullptr;
+    C10_CUDA_CHECK(cudaEventCreateWithFlags(&ready, cudaEventDisableTiming));
+    C10_CUDA_CHECK(cudaEventCreateWithFlags(&done, cudaEventDisableTiming));
+    dev = device;
+  }
+};
+CachedBwdEvents& BwdEventsRef() {
+  static thread_local CachedBwdEvents ev;
+  return ev;
+}
+}  // namespace
+
 void LaunchBackwardPhases(const Params& params, const umma::UmmaLaunchParams& native,
-                          const BackwardPhases& phases, cudaStream_t stream) {
-  const char* reason = nullptr;
+                          const BackwardPhases& phases, cudaStream_t stream,
+                          bool tables_ready_on_fork, cudaStream_t fork_stream,
+                          cudaEvent_t meta_done_event, bool skip_recheck) {
   const bool legtime = LegTimeOn();          // ONE resolution per call, not per launch
-  TORCH_CHECK(CheckBackwardPhases(params, native, phases, &reason),
-              "native FlashSCA backward: invalid launch plan: ", reason ? reason : "unknown");
+  if (!skip_recheck) {
+    const char* reason = nullptr;
+    TORCH_CHECK(CheckBackwardPhases(params, native, phases, &reason),
+                "native FlashSCA backward: invalid launch plan: ", reason ? reason : "unknown");
+  }
   if (legtime) LegBoundary(kLegStart, stream);
   umma::UmmaLaunchParams call = native;
   call.params = params;
-  LaunchBackwardStages(params, stream, kStageDelta);
+  if (tables_ready_on_fork) {
+    LaunchDeltaOnly(params, stream);
+    RecordPhase(Phase::kDelta, Body::kScalar, Body::kScalar, State::kRan);
+  } else {
+    LaunchBackwardStages(params, stream, kStageDelta);
+  }
   if (legtime) LegBoundary(kLegAfterDelta, stream);
-  // The two native leaves own disjoint outputs -- the dQ leaf writes only dQ, the key leaf
-  // only dK/dV -- and neither writes atomically, so nothing about the result depends on
-  // their order or on whether they overlap: run them on two streams and join before the
-  // call returns. It is worth doing because the key leaf's CTAs are not equally heavy: at
-  // the MoE rows its 1024 CTAs (6.9 waves of a 148-SM GPU) carry 2 to 128 query tiles each
-  // (mean 33), so its last wave leaves SMs idle while the dQ leaf's 4096 CTAs (27.7 waves,
-  // mean 17) could be using them. The key leaf is enqueued first so that its tail is the
-  // part the dQ leaf fills, the event join puts both back in front of anything the caller
-  // enqueues next. The leg timer measures the serial order, so it keeps it.
   const bool overlap = phases.native.dq && phases.native.dkdv &&
       !phases.native.dkdv_atomic_dq && !legtime && !BwdLeavesSerialForced();
   if (overlap) {
-    const c10::cuda::CUDAStream fork =
-        c10::cuda::getStreamFromPool(/*isHighPriority=*/false, c10::cuda::current_device());
-    cudaEvent_t ready = nullptr;
-    cudaEvent_t done = nullptr;
-    C10_CUDA_CHECK(cudaEventCreateWithFlags(&ready, cudaEventDisableTiming));
-    C10_CUDA_CHECK(cudaEventCreateWithFlags(&done, cudaEventDisableTiming));
-    C10_CUDA_CHECK(cudaEventRecord(ready, stream));
-    C10_CUDA_CHECK(cudaStreamWaitEvent(fork.stream(), ready, 0));
-    LaunchLeaf(umma::BackwardProduct::kDkdv, call, stream);
-    LaunchLeaf(umma::BackwardProduct::kDq, call, fork.stream());
-    C10_CUDA_CHECK(cudaEventRecord(done, fork.stream()));
-    C10_CUDA_CHECK(cudaStreamWaitEvent(stream, done, 0));
-    C10_CUDA_CHECK(cudaEventDestroy(ready));
-    C10_CUDA_CHECK(cudaEventDestroy(done));
+    const int dev = c10::cuda::current_device();
+    CachedBwdEvents& ev = BwdEventsRef();
+    ev.Ensure(dev);
+    cudaStream_t fstream = fork_stream;
+    if (fstream == nullptr) {
+      fstream = c10::cuda::getStreamFromPool(/*isHighPriority=*/false, dev).stream();
+    }
+    if (tables_ready_on_fork && meta_done_event != nullptr) {
+      C10_CUDA_CHECK(cudaStreamWaitEvent(stream, meta_done_event, 0));
+    }
+    C10_CUDA_CHECK(cudaEventRecord(ev.ready, stream));
+    C10_CUDA_CHECK(cudaStreamWaitEvent(fstream, ev.ready, 0));
+    LaunchLeaf(umma::BackwardProduct::kDq, call, stream);
+    LaunchLeaf(umma::BackwardProduct::kDkdv, call, fstream);
+    C10_CUDA_CHECK(cudaEventRecord(ev.done, fstream));
+    C10_CUDA_CHECK(cudaStreamWaitEvent(stream, ev.done, 0));
     if (legtime) LegBoundary(kLegAfterKey, stream);
   } else {
+    if (tables_ready_on_fork && meta_done_event != nullptr) {
+      C10_CUDA_CHECK(cudaStreamWaitEvent(stream, meta_done_event, 0));
+    }
     if (phases.native.dq) LaunchLeaf(umma::BackwardProduct::kDq, call, stream);
     if (legtime) LegBoundary(kLegAfterDq, stream);
     if (phases.native.dkdv) LaunchLeaf(umma::BackwardProduct::kDkdv, call, stream);

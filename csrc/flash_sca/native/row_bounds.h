@@ -69,6 +69,9 @@ struct RowBoundsMaskArgs {
   const uint8_t* mask = nullptr;  // [batch, total], bool: 1 starts a segment
   int32_t* row_lo = nullptr;      // [batch, q_length]
   int32_t* row_hi = nullptr;      // [batch, q_length]
+  // Optional per-128-row query tile bounds [batch, ceil(q_length/128), 4]:
+  // {min_lo, max_hi, max_lo, min_hi}, computed in the same pass as row_lo/row_hi.
+  int32_t* tile128_bounds = nullptr;
   int64_t batch = 0;
   int64_t q_length = 0;
   int64_t total = 0;  // <= kMaskMaxKeys
@@ -79,6 +82,12 @@ struct RowBoundsMaskArgs {
 
 void LaunchRowBounds(const RowBoundsArgs& args, cudaStream_t stream);
 void LaunchRowBoundsMask(const RowBoundsMaskArgs& args, cudaStream_t stream);
+void LaunchBuildFwdLjf(const int32_t* tile128_bounds, int32_t* q_ljf_out,
+                       unsigned int* fwd_counter, int64_t batch, int64_t q_length,
+                       int64_t total_length, cudaStream_t stream);
+struct Params;
+void LaunchTile128BoundsAndFwdLjf(const Params& p, int32_t* tile128_bounds, int32_t* q_ljf_out,
+                                  unsigned int* fwd_counter, cudaStream_t stream);
 
 // ---- The backward main's route ----
 //
@@ -109,20 +118,21 @@ void LaunchRowBoundsMask(const RowBoundsMaskArgs& args, cudaStream_t stream);
 void LaunchRowBoundsFromBos(const unsigned char* bos, int32_t* lo, int32_t* hi,
                             int64_t batch, int64_t total, int64_t q_length, int64_t shift,
                             int32_t chunk_size, bool strict_past, bool reset,
-                            cudaStream_t stream);
+                            cudaStream_t stream, int32_t* tile_bounds_out = nullptr,
+                            bool tile128 = false);
 
-// H25: the segment ids a packed-sequence BOS mask names (one int64 per key, the count of BOS
-// positions at or before it: the same values as `bos_mask.cumsum(dim=1, dtype=torch.int64)`,
-// bit for bit -- an inclusive integer prefix sum, so there is only one correct result and every
-// sound scan gives it). SoftDelta's composed backward passes these ids (not the mask) to its
-// private reads, which read a per-key segment id on chip (SegmentTest / `p.q_segment`,
-// `p.k_segment`); building them with torch's generic scan measured 53-58 us/call (one launch,
-// shared by both reads since D7/H9), independent of the mask's visible-key share. One block per
-// batch row, a two-pass block scan (every thread's own contiguous run, then a block-wide
-// Hillis-Steele scan of the per-thread totals): batch is at most a few dozen for any shape the
-// API accepts, so a few blocks finish in microseconds.
 void LaunchSegmentIdsFromBos(const unsigned char* bos, int64_t* ids, int64_t batch,
                              int64_t total, cudaStream_t stream);
+
+struct Params;
+void LaunchTileBoundsAndKeyRange(const Params& p, cudaStream_t stream);
+void LaunchBuildLjfWorklists(const Params& p, int32_t* kv_ljf_out, int32_t* q_ljf_out,
+                             unsigned int* kv_counter, unsigned int* dq_counter,
+                             cudaStream_t stream);
+void LaunchKeyRangeAndLjf(const Params& p, bool tile_bounds_ready, int32_t* kv_ljf_out,
+                          int32_t* q_ljf_out, unsigned int* kv_counter, unsigned int* dq_counter,
+                          cudaStream_t stream);
+void LaunchDeltaOnly(const Params& p, cudaStream_t stream);
 // (sha marker)
 
 }  // namespace xattn::ops::flash_sca_native
